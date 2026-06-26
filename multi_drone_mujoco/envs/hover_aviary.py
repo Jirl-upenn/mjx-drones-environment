@@ -25,11 +25,15 @@ class HoverAviary(BaseAviary):
         record: bool = False,
         obstacles: bool = False,
         target_height: float = 1.0,
+        episode_len_sec: float = 10.0,
         initial_xyzs=None,
         render_mode=None,
+        act_type: ActionType = ActionType.RPM,
+        fly_box=None,
     ):
         self.TARGET_HEIGHT = target_height
-        self.EPISODE_LEN_SEC = 10
+        self.EPISODE_LEN_SEC = episode_len_sec
+        self._fly_box = tuple(fly_box) if fly_box is not None else None
         if initial_xyzs is None:
             initial_xyzs = np.array([[0.0, 0.0, 0.1]])
 
@@ -43,7 +47,7 @@ class HoverAviary(BaseAviary):
             record=record,
             obstacles=obstacles,
             obs_type=ObservationType.KIN,
-            act_type=ActionType.RPM,
+            act_type=act_type,
             initial_xyzs=initial_xyzs,
             render_mode=render_mode,
         )
@@ -97,17 +101,14 @@ class HoverAviary(BaseAviary):
         return float(reward)
 
     def _computeTerminated(self):
-        """Terminate if drone crashes or flips."""
-        state = self._getDroneStateVector(0)
-        pos = state[0:3]
-        rpy = state[7:10]
-
-        if pos[2] < 0.0:
+        """Matches MJXAviaryPureJaxAdapter termination conditions exactly."""
+        pos = self._getDroneStateVector(0)[0:3]
+        if pos[2] < 0.05:  # floor contact (cylinder half-height 0.015m → rests at ~0.015m)
             return True
-        if abs(rpy[0]) > np.pi / 2 or abs(rpy[1]) > np.pi / 2:
-            return True
-        if pos[2] > 3.0:
-            return True
+        if self._fly_box is not None:
+            hx, hy, hz = self._fly_box
+            if abs(pos[0]) > hx or abs(pos[1]) > hy or pos[2] > hz:
+                return True
         return False
 
     def _computeTruncated(self):
