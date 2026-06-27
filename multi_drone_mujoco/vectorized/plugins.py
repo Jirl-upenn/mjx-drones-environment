@@ -27,11 +27,12 @@ class TaskPlugin(ABC):
         """Return the initial *batched* task state (leading dim = num_envs)."""
 
     @abstractmethod
-    def reset_task_state(self, data: Any, rng: Any) -> Any:
+    def reset_task_state(self, data: Any, rng: Any, hint: Any = None) -> Any:
         """Return the initial task state for a *single* env.  Called inside vmap.
 
-        ``data`` is the post-reset mjx.Data for this env, available so plugins
-        can compute derived initial values (e.g. distance to target).
+        ``data`` is the post-reset mjx.Data for this env.  ``hint`` carries an
+        optional value returned by the custom reset function (e.g. the gate index
+        chosen by _PreGate); plugins that don't need it can ignore it.
         """
 
     @abstractmethod

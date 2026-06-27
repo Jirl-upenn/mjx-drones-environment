@@ -321,8 +321,13 @@ class MJXVectorAviary:
     def _single_reset(self, state: MJXState, rng: Any) -> MJXState:
         """Reset a single environment (vmapped over batch)."""
         data = mjx.put_data(self._mj_model, mujoco.MjData(self._mj_model))
+        reset_hint = None
         if self._custom_reset_fn is not None:
-            data = self._custom_reset_fn(data, rng)
+            result = self._custom_reset_fn(data, rng)
+            if isinstance(result, tuple):
+                data, reset_hint = result
+            else:
+                data = result
         elif self.task == "race":
             qpos = data.qpos.at[:3].set(jnp.array([0.0, 0.0, 0.5]))
             qpos = qpos.at[3:7].set(jnp.array([1.0, 0.0, 0.0, 0.0]))
@@ -338,7 +343,7 @@ class MJXVectorAviary:
         data = mjx.forward(self._mjx_model, data)
 
         rng, task_rng = jax.random.split(rng)
-        task_state = self._task.reset_task_state(data, task_rng)
+        task_state = self._task.reset_task_state(data, task_rng, reset_hint)
 
         reset_info = {"reward_terms": jnp.zeros(self._num_terms)} if self._num_terms > 0 else {}
         return MJXState(
