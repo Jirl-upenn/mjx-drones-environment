@@ -26,6 +26,7 @@ class RaceAviary(BaseAviary):
         gate_radius: float = 0.2,
         initial_xyzs=None,
         render_mode=None,
+        extra_worldbody_xml: str = "",
     ):
         self.EPISODE_LEN_SEC = 30
         self.GATE_RADIUS = gate_radius
@@ -62,6 +63,7 @@ class RaceAviary(BaseAviary):
             act_type=ActionType.RPM,
             initial_xyzs=initial_xyzs,
             render_mode=render_mode,
+            extra_worldbody_xml=extra_worldbody_xml,
         )
 
     def reset(self, seed=None, options=None):

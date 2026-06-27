@@ -106,6 +106,7 @@ def _generate_aviary_xml(
     obstacles: bool = False,
     vision: bool = False,
     timestep: float = 1 / 240,
+    extra_worldbody_xml: str = "",
 ) -> str:
     """Generate MuJoCo XML for the aviary with N drones."""
     meshdir = str(CF2_MESH_DIR)
@@ -253,7 +254,7 @@ def _generate_aviary_xml(
   <worldbody>
     <light pos="0 0 3" dir="0 0 -1" directional="true" castshadow="false"/>
     <geom name="floor" size="10 10 0.05" type="plane" material="groundplane" contype="1" conaffinity="1"/>
-{drone_bodies}{obstacle_bodies}
+{extra_worldbody_xml}{drone_bodies}{obstacle_bodies}
   </worldbody>
 
   <sensor>
@@ -299,6 +300,7 @@ class BaseAviary(gym.Env):
         act_type: ActionType = ActionType.RPM,
         output_folder: str = "results",
         render_mode: Optional[str] = None,
+        extra_worldbody_xml: str = "",
     ):
         """Initialize the aviary.
 
@@ -425,6 +427,7 @@ class BaseAviary(gym.Env):
             obstacles=obstacles,
             vision=vision_attributes,
             timestep=self.SIM_TIMESTEP,
+            extra_worldbody_xml=extra_worldbody_xml,
         )
         self.model = mujoco.MjModel.from_xml_string(xml_str)
         self.data = mujoco.MjData(self.model)
@@ -1018,10 +1021,11 @@ class BaseAviary(gym.Env):
     ############################################################################
 
     # Camera mode constants
-    CAMERA_TRACK = "track"       # Follows drone from fixed distance
-    CAMERA_FPV = "fpv"           # First-person (egocentric) from drone
-    CAMERA_FIXED = "fixed"       # Fixed third-person view
-    CAMERA_FRONT = "front"       # Front view looking along X-axis
+    CAMERA_TRACK    = "track"     # Follows drone from fixed distance
+    CAMERA_FPV      = "fpv"      # First-person (egocentric) from drone
+    CAMERA_FIXED    = "fixed"    # Fixed third-person view
+    CAMERA_FRONT    = "front"    # Front view looking along X-axis
+    CAMERA_OVERVIEW = "overview" # Wide static view; params from _overview_camera dict
 
     def render(self, camera_mode=None, track_drone_id=0):
         """Render the environment.
@@ -1082,6 +1086,17 @@ class BaseAviary(gym.Env):
                 camera.distance = 1.2
                 camera.azimuth = -60
                 camera.elevation = -25
+
+            elif camera_mode == self.CAMERA_OVERVIEW:
+                # Wide static view for tasks with large arenas.
+                # Parameters come from self._overview_camera (set by eval from plugin);
+                # falls back to a sensible high wide-angle default.
+                cfg = getattr(self, "_overview_camera", None) or {}
+                camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+                camera.lookat[:] = cfg.get("lookat", [0.0, 0.0, 1.0])
+                camera.distance  = cfg.get("distance", 14.0)
+                camera.azimuth   = cfg.get("azimuth",  -30.0)
+                camera.elevation = cfg.get("elevation", -55.0)
 
             else:  # CAMERA_TRACK (default)
                 # Tracks the drone(s) from a fixed relative distance

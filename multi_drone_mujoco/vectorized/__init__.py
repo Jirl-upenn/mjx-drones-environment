@@ -188,7 +188,7 @@ class MJXVectorAviary:
         self._gates_xyz_np = getattr(plugin, "gate_xyz_np", None)
 
         # Build MuJoCo model
-        self._xml = self._generate_xml()
+        self._xml = self._generate_xml(plugin)
         self._mj_model = mujoco.MjModel.from_xml_string(self._xml)
         self._mjx_model = mjx.put_model(self._mj_model)
 
@@ -350,7 +350,7 @@ class MJXVectorAviary:
             task_state=task_state,
         )
 
-    def _generate_xml(self) -> str:
+    def _generate_xml(self, plugin) -> str:
         """Generate minimal MuJoCo XML for MJX compilation."""
         mass = self.mass
         ixx, iyy, izz = 1.4e-5, 1.4e-5, 2.17e-5
@@ -377,13 +377,7 @@ class MJXVectorAviary:
       <site name="drone{d}_center" pos="0 0 0"/>
     </body>"""
 
-        gate_markers = ""
-        if self.task == "race" and self._gates_xyz_np is not None:
-            for i, (x, y, z) in enumerate(self._gates_xyz_np):
-                gate_markers += (
-                    f'    <geom name="gate{i}" type="sphere" pos="{x} {y} {z}" '
-                    f'size="0.10" rgba="0.0 1.0 0.25 1.0" contype="0" conaffinity="0"/>\n'
-                )
+        extra_worldbody = plugin.extra_worldbody_xml()
 
         return f"""<mujoco model="mjx_aviary">
   <option integrator="RK4" timestep="{1.0/self.sim_freq}" gravity="0 0 -{self.gravity}"/>
@@ -402,7 +396,7 @@ class MJXVectorAviary:
     <light pos="4 2 4" dir="-1 -0.5 -1" diffuse="0.5 0.5 0.5" specular="0.1 0.1 0.1" directional="true"/>
     <light pos="-2 4 3" dir="0.5 -1 -1" diffuse="0.35 0.35 0.35" directional="true"/>
     <geom name="floor" size="2 2 0.05" type="plane" rgba="0.15 0.30 0.65 1" contype="1" conaffinity="1"/>
-{gate_markers}{drones}
+{extra_worldbody}{drones}
   </worldbody>
 </mujoco>"""
 

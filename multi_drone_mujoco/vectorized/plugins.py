@@ -54,3 +54,29 @@ class TaskPlugin(ABC):
     @abstractmethod
     def get_obs(self, data: Any, task_state: Any) -> Any:
         """Extract observation for a single env (called inside vmap)."""
+
+    def extra_worldbody_xml(self) -> str:
+        """Return XML fragment to inject into <worldbody> at model build time.
+
+        Override in task plugins to add task-specific static geometry
+        (gates, targets, obstacles, etc.).  The returned string is inserted
+        verbatim inside <worldbody> before the drone bodies.
+        """
+        return ""
+
+    def default_camera_mode(self) -> str:
+        """Return the preferred camera mode for eval rendering.
+
+        Override to return a mode string understood by BaseAviary.render()
+        (e.g. "overview").  The base default "track" follows the drone.
+        """
+        return "track"
+
+    def camera_config(self) -> "dict | None":
+        """Return camera parameters for the 'overview' render mode, or None.
+
+        Return a dict with keys: lookat ([x,y,z]), distance, azimuth, elevation.
+        Used when default_camera_mode() == 'overview'.  None means BaseAviary
+        will use its own sensible defaults.
+        """
+        return None
