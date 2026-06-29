@@ -206,6 +206,12 @@ class MJXVectorAviary:
         self._compute_terms_fn = getattr(_reward_fn, 'compute_terms', None)
         self._num_terms: int = len(getattr(_reward_fn, 'term_names', []))
 
+        # Named termination conditions (optional — enabled when plugin exposes termination_names)
+        self._num_terminations: int = len(getattr(plugin, 'termination_names', []))
+
+        # Task metric decomposition (optional — enabled when plugin exposes task_metric_names)
+        self._num_task_metrics: int = len(getattr(plugin, 'task_metric_names', []))
+
         # JIT-compile core functions
         self._step_fn  = jit(vmap(self._single_step))
         self._reset_fn = jit(vmap(self._single_reset))
@@ -300,13 +306,25 @@ class MJXVectorAviary:
 
         step_count = state.step_count + 1
         new_task_state, obs, reward, extra_done = self._task.step(data, action, state.task_state)
-        done = (step_count >= self.episode_length) | extra_done
+        timeout = step_count >= self.episode_length
 
-        if self._num_terms > 0:
-            reward_terms = self._compute_terms_fn(data, action, state.task_state)
-            step_info = {"reward_terms": reward_terms}
+        # Named termination checks — plugin-defined, resolved at trace time.
+        if self._num_terminations > 0:
+            plugin_terms = self._task.termination_checks(data, new_task_state)
+            extra_done = extra_done | jnp.any(plugin_terms)
         else:
-            step_info = {}
+            plugin_terms = jnp.zeros(0, dtype=jnp.bool_)
+
+        done = timeout | extra_done
+
+        step_info = {}
+        if self._num_terms > 0:
+            step_info["reward_terms"] = self._compute_terms_fn(data, action, state.task_state)
+        if self._num_task_metrics > 0:
+            step_info["task_metrics"] = self._task.task_metrics(new_task_state)
+        step_info["terminations"] = jnp.concatenate(
+            [jnp.array([timeout], dtype=jnp.bool_), plugin_terms]
+        )
 
         new_state = MJXState(
             mjx_data=data,
@@ -345,7 +363,12 @@ class MJXVectorAviary:
         rng, task_rng = jax.random.split(rng)
         task_state = self._task.reset_task_state(data, task_rng, reset_hint)
 
-        reset_info = {"reward_terms": jnp.zeros(self._num_terms)} if self._num_terms > 0 else {}
+        reset_info = {}
+        if self._num_terms > 0:
+            reset_info["reward_terms"] = jnp.zeros(self._num_terms)
+        if self._num_task_metrics > 0:
+            reset_info["task_metrics"] = jnp.zeros(self._num_task_metrics)
+        reset_info["terminations"] = jnp.zeros(1 + self._num_terminations, dtype=jnp.bool_)
         return MJXState(
             mjx_data=data,
             step_count=jnp.int32(0),
@@ -401,7 +424,7 @@ class MJXVectorAviary:
     <light pos="4 2 4" dir="-1 -0.5 -1" diffuse="0.5 0.5 0.5" specular="0.1 0.1 0.1" directional="true"/>
     <light pos="-2 4 3" dir="0.5 -1 -1" diffuse="0.35 0.35 0.35" directional="true"/>
     <geom name="floor" size="2 2 0.05" type="plane" rgba="0.15 0.30 0.65 1" contype="1" conaffinity="1"/>
-{extra_worldbody}{drones}
+{drones}{extra_worldbody}
   </worldbody>
 </mujoco>"""
 

@@ -131,8 +131,10 @@ class RaceAviary(BaseAviary):
         for i in range(self.NUM_DRONES):
             if self.pos[i, 2] < 0.0:
                 return True
+            '''
             if abs(self.rpy[i, 0]) > 2.0 or abs(self.rpy[i, 1]) > 2.0:  # More lenient for racing
                 return True
+            '''
         return False
 
     def _computeTruncated(self):

@@ -56,6 +56,30 @@ class TaskPlugin(ABC):
     def get_obs(self, data: Any, task_state: Any) -> Any:
         """Extract observation for a single env (called inside vmap)."""
 
+    termination_names: list = []
+
+    def termination_checks(self, data, task_state) -> "Any":
+        """Return a 1-D bool array of named termination conditions for one env.
+
+        Shape must be (len(termination_names),). Called inside vmap — operates on
+        a single env. Default returns empty; override together with termination_names
+        to enable per-cause W&B termination logging.
+        """
+        import jax.numpy as jnp
+        return jnp.zeros(0, dtype=jnp.bool_)
+
+    task_metric_names: list = []
+
+    def task_metrics(self, task_state) -> "Any":
+        """Return a 1-D array of task-specific metrics for one env at one step.
+
+        Shape must be (len(task_metric_names),). Called inside vmap — operates on
+        a single env's task_state, not a batched one. Default returns nothing;
+        override together with task_metric_names to enable W&B task metric logging.
+        """
+        import jax.numpy as jnp
+        return jnp.zeros(0)
+
     def extra_worldbody_xml(self) -> str:
         """Return XML fragment to inject into <worldbody> at model build time.
 
