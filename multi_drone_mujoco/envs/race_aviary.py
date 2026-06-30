@@ -24,9 +24,11 @@ class RaceAviary(BaseAviary):
         record: bool = False,
         gates=None,
         gate_radius: float = 0.2,
+        gate_normals=None,
         initial_xyzs=None,
         render_mode=None,
         extra_worldbody_xml: str = "",
+        act_type: ActionType = ActionType.RPM,
     ):
         self.EPISODE_LEN_SEC = 30
         self.GATE_RADIUS = gate_radius
@@ -44,7 +46,11 @@ class RaceAviary(BaseAviary):
         else:
             self.GATES = np.array(gates)
 
+        # Unit normals pointing against travel direction, one per gate.
+        # When provided, _computeReward uses plane-crossing detection (matches MJX training).
+        self.GATE_NORMALS = np.array(gate_normals, dtype=np.float32) if gate_normals is not None else None
         self.gates_passed = None
+        self._prev_gate_x = None  # sign of (pos - gate_pos) · normal, previous step
 
         if initial_xyzs is None:
             initial_xyzs = np.array([[0.0, 0.0, 0.5]] * num_drones)
@@ -60,7 +66,7 @@ class RaceAviary(BaseAviary):
             gui=gui,
             record=record,
             obs_type=ObservationType.KIN,
-            act_type=ActionType.RPM,
+            act_type=act_type,
             initial_xyzs=initial_xyzs,
             render_mode=render_mode,
             extra_worldbody_xml=extra_worldbody_xml,
@@ -68,6 +74,8 @@ class RaceAviary(BaseAviary):
 
     def reset(self, seed=None, options=None):
         self.gates_passed = np.zeros((self.NUM_DRONES,), dtype=int)
+        if self.GATE_NORMALS is not None:
+            self._prev_gate_x = np.ones(self.NUM_DRONES, dtype=np.float32)
         return super().reset(seed=seed, options=options)
 
     def _actionSpace(self):
@@ -79,13 +87,6 @@ class RaceAviary(BaseAviary):
     def _observationSpace(self):
         # pos(3) + rpy(3) + vel(3) + angvel(3) + next_gate(3) + rel_gate(3) + gate_after(3) = 21
         return spaces.Box(low=-np.inf, high=np.inf, shape=(21 * self.NUM_DRONES,), dtype=np.float32)
-
-    def _preprocessAction(self, action):
-        action = np.clip(np.array(action).reshape(self.NUM_DRONES, 4), -1, 1)
-        rpms = np.zeros((self.NUM_DRONES, 4))
-        for i in range(self.NUM_DRONES):
-            rpms[i] = self._normalizedActionToRPM(action[i])
-        return rpms
 
     def _computeObs(self):
         obs_list = []
@@ -106,19 +107,31 @@ class RaceAviary(BaseAviary):
         for i in range(self.NUM_DRONES):
             gate_idx = self.gates_passed[i] % len(self.GATES)
             gate = self.GATES[gate_idx]
-            dist = np.linalg.norm(self.pos[i] - gate)
+            rel = self.pos[i] - gate
+            dist = np.linalg.norm(rel)
 
-            # Gate passed
-            if dist < self.GATE_RADIUS:
+            if self.GATE_NORMALS is not None:
+                # Plane-crossing detection: matches MJX plugin (sign change of x_wrt_gate
+                # while within 1 m of gate center).
+                normal = self.GATE_NORMALS[gate_idx]
+                x_wrt_gate = float(np.dot(rel, normal))
+                just_passed = (
+                    x_wrt_gate < 0.0
+                    and self._prev_gate_x[i] > 0.0
+                    and dist < 1.0
+                )
+                # After crossing, reset x so re-entry from behind doesn't re-trigger.
+                self._prev_gate_x[i] = 1.0 if just_passed else x_wrt_gate
+            else:
+                just_passed = dist < self.GATE_RADIUS
+
+            if just_passed:
                 self.gates_passed[i] += 1
-                total += 20.0  # Big reward for passing gate
-                # Speed bonus
+                total += 20.0
                 total += np.linalg.norm(self.vel[i]) * 2.0
 
-            # Approach reward
             total -= dist * 0.05
 
-            # Penalize crash risk
             if self.pos[i, 2] < 0.1:
                 total -= 1.0
 

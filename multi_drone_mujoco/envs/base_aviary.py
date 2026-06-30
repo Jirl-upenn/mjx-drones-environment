@@ -911,17 +911,18 @@ class BaseAviary(gym.Env):
 
         elif self.ACT_TYPE == ActionType.ATTITUDE:
             # [thrust_normalized, roll, pitch, yaw_rate] → RPMs via mixer
+            # Matches MJXVectorAviary._single_step attitude formula exactly:
+            #   collective = hover_rpm ± 30 %,  differential scale = 2 % of hover_rpm
             action = np.array(action).reshape(self.NUM_DRONES, 4)
             rpms = np.zeros((self.NUM_DRONES, 4))
             for i in range(self.NUM_DRONES):
                 thrust_norm, roll_cmd, pitch_cmd, yaw_rate_cmd = action[i]
-                # Convert thrust to collective RPM
-                collective_rpm = self.HOVER_RPM + (self.MAX_RPM - self.HOVER_RPM) * thrust_norm
-                # Simple mixer (X-config)
-                rpms[i, 0] = collective_rpm + roll_cmd * 0.25 * self.MAX_RPM - pitch_cmd * 0.25 * self.MAX_RPM - yaw_rate_cmd * 0.25 * self.MAX_RPM
-                rpms[i, 1] = collective_rpm - roll_cmd * 0.25 * self.MAX_RPM - pitch_cmd * 0.25 * self.MAX_RPM + yaw_rate_cmd * 0.25 * self.MAX_RPM
-                rpms[i, 2] = collective_rpm - roll_cmd * 0.25 * self.MAX_RPM + pitch_cmd * 0.25 * self.MAX_RPM - yaw_rate_cmd * 0.25 * self.MAX_RPM
-                rpms[i, 3] = collective_rpm + roll_cmd * 0.25 * self.MAX_RPM + pitch_cmd * 0.25 * self.MAX_RPM + yaw_rate_cmd * 0.25 * self.MAX_RPM
+                collective_rpm = self.HOVER_RPM + 0.3 * self.HOVER_RPM * thrust_norm
+                scale = 0.02 * self.HOVER_RPM
+                rpms[i, 0] = collective_rpm + roll_cmd * scale - pitch_cmd * scale - yaw_rate_cmd * scale
+                rpms[i, 1] = collective_rpm - roll_cmd * scale - pitch_cmd * scale + yaw_rate_cmd * scale
+                rpms[i, 2] = collective_rpm - roll_cmd * scale + pitch_cmd * scale - yaw_rate_cmd * scale
+                rpms[i, 3] = collective_rpm + roll_cmd * scale + pitch_cmd * scale + yaw_rate_cmd * scale
             return np.clip(rpms, 0, self.MAX_RPM)
 
         raise ValueError(f"Unknown action type: {self.ACT_TYPE}")
