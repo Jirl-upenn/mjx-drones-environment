@@ -86,7 +86,6 @@ class MJXState(NamedTuple):
     """
     mjx_data: Any           # mjx.Data (batched over num_envs)
     step_count: Any         # jnp.ndarray (num_envs,) int32
-    rng: Any                # PRNGKey
     done: Any               # jnp.ndarray (num_envs,) bool
     info: Dict[str, Any]    # additional info
     task_state: Any         # HoverTaskState | RaceTaskState | custom
@@ -277,7 +276,6 @@ class MJXVectorAviary:
         state = MJXState(
             mjx_data=batched_data,
             step_count=jnp.zeros(self.num_envs, dtype=jnp.int32),
-            rng=rngs,
             done=jnp.zeros(self.num_envs, dtype=jnp.bool_),
             info={},
             task_state=self._task.init_task_state(self.num_envs),
@@ -408,7 +406,6 @@ class MJXVectorAviary:
         new_state = MJXState(
             mjx_data=data,
             step_count=step_count,
-            rng=state.rng,
             done=done,
             info=step_info,
             task_state=new_task_state,
@@ -453,7 +450,6 @@ class MJXVectorAviary:
         return MJXState(
             mjx_data=data,
             step_count=jnp.int32(0),
-            rng=rng,
             done=jnp.bool_(False),
             info=reset_info,
             task_state=task_state,
