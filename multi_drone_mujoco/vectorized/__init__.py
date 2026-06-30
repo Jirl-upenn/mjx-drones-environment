@@ -154,6 +154,7 @@ class MJXVectorAviary:
         backend: Optional[str] = None,
         reset_fn=None,
         action_type: str = "rpm",
+        bounding_box: Optional[Tuple[float, float, float]] = None,
     ):
         _check_deps()
         if plugin is None:
@@ -173,6 +174,7 @@ class MJXVectorAviary:
             raise ValueError(f"action_type must be 'rpm' or 'attitude', got {action_type!r}")
         self._action_type = action_type
         self._custom_reset_fn = reset_fn
+        self._bounding_box = bounding_box
 
         # Physical constants (Crazyflie 2.x)
         self.mass = 0.027
@@ -212,6 +214,20 @@ class MJXVectorAviary:
         # Task metric decomposition (optional — enabled when plugin exposes task_metric_names)
         self._num_task_metrics: int = len(getattr(plugin, 'task_metric_names', []))
 
+        # Per-episode task metrics (optional — enabled when plugin exposes task_episode_metric_names)
+        self._num_episode_task_metrics: int = len(getattr(plugin, 'task_episode_metric_names', []))
+
+        # Bounding box adds one extra termination flag.
+        self._num_bbox_terms: int = 1 if bounding_box is not None else 0
+
+        # Death cost: read from reward fn; grace terminations skip the penalty.
+        _reward_fn = getattr(plugin, '_reward_fn', None)
+        self._death_cost: float = getattr(_reward_fn, 'death_cost', 0.0)
+        _grace_names = {"timeout", "lap_limit"}
+        self._grace_indices = [
+            i for i, n in enumerate(self.termination_names) if n in _grace_names
+        ]
+
         # JIT-compile core functions
         self._step_fn  = jit(vmap(self._single_step))
         self._reset_fn = jit(vmap(self._single_reset))
@@ -224,19 +240,34 @@ class MJXVectorAviary:
     def action_shape(self) -> Tuple[int, ...]:
         return (self.act_dim,)
 
-    def reset(self, rng: Any) -> MJXState:
-        """Reset all environments.
+    @property
+    def termination_names(self) -> list:
+        """Ordered termination condition names matching the last axis of info['terminations']."""
+        plugin_names = list(getattr(self._task, 'termination_names', []))
+        names = ["timeout"] + plugin_names
+        if self._bounding_box is not None:
+            names += ["out_of_bounds"]
+        return names
 
-        Parameters
-        ----------
-        rng : PRNGKey
-            JAX random key (split internally per env).
+    class _Space:
+        """Minimal space stand-in that exposes .shape for obs/action dims."""
+        def __init__(self, shape: tuple):
+            self.shape = shape
+
+    def observation_space(self, params=None) -> "_Space":
+        return self._Space((self.obs_dim,))
+
+    def action_space(self, params=None) -> "_Space":
+        return self._Space((self.act_dim,))
+
+    def reset(self, keys: Any, params=None) -> Tuple[Any, MJXState]:
+        """Reset all environments.  PureJaxRL interface: keys has shape (num_envs, 2).
 
         Returns
         -------
-        MJXState
-            Initial state with batched mjx data and task state.
+        (obs, state) : ((num_envs, obs_dim), MJXState)
         """
+        rng = keys[0]
         rngs = random.split(rng, self.num_envs)
         mjx_data = mjx.put_data(self._mj_model, mujoco.MjData(self._mj_model))
         batched_data = jax.tree.map(
@@ -251,13 +282,45 @@ class MJXVectorAviary:
             info={},
             task_state=self._task.init_task_state(self.num_envs),
         )
-        return self._reset_fn(state, rngs)
+        state = self._reset_fn(state, rngs)
+        obs = vmap(self._task.get_obs)(state.mjx_data, state.task_state)
+        return obs, state
 
-    def step(self, state: MJXState, action: Any) -> Tuple[MJXState, Any, Any, Any, Dict]:
-        """Step all environments in parallel."""
+    def step(self, keys: Any, state: MJXState, action: Any, params=None) -> Tuple[Any, MJXState, Any, Any, Dict]:
+        """Step all environments with auto-reset for done envs.
+
+        PureJaxRL interface: keys has shape (num_envs, 2); used as per-env
+        reset seeds for environments that terminate this step.
+
+        Returns
+        -------
+        (obs, state, reward, done, info)
+        """
         action = jnp.clip(action, -1.0, 1.0)
-        state, obs, reward, done = self._step_fn(state, action)
-        return state, obs, reward, done, state.info
+        next_state, obs, reward, done = self._step_fn(state, action)
+        info = next_state.info
+
+        if self._death_cost != 0.0:
+            terminations = info["terminations"]
+            is_grace = jnp.zeros(self.num_envs, dtype=jnp.bool_)
+            for idx in self._grace_indices:
+                is_grace = is_grace | terminations[:, idx]
+            is_crash = done & ~is_grace
+            reward = jnp.where(is_crash, reward + self._death_cost, reward)
+
+        reset_state = self._reset_fn(next_state, keys)
+        reset_obs = vmap(self._task.get_obs)(reset_state.mjx_data, reset_state.task_state)
+
+        def _select(r, n):
+            if not hasattr(r, "ndim") or r.ndim == 0:
+                return r
+            mask = done.reshape((done.shape[0],) + (1,) * (r.ndim - 1))
+            return jnp.where(mask, r, n)
+
+        final_state = jax.tree_util.tree_map(_select, reset_state, next_state)
+        final_obs = jnp.where(done[:, None], reset_obs, obs)
+
+        return final_obs, final_state, reward, done, info
 
     def get_obs(self, state: MJXState) -> Any:
         """Extract observations from a batched state."""
@@ -315,6 +378,20 @@ class MJXVectorAviary:
         else:
             plugin_terms = jnp.zeros(0, dtype=jnp.bool_)
 
+        # Generic workspace bounding box — resolved at trace time.
+        if self._bounding_box is not None:
+            pos = data.xpos[_BODY_ID]
+            hx, hy, hz = self._bounding_box
+            out_of_bounds = (
+                (jnp.abs(pos[0]) > hx)
+                | (jnp.abs(pos[1]) > hy)
+                | (pos[2] > hz)
+            )
+            extra_done = extra_done | out_of_bounds
+            bbox_terms = jnp.array([out_of_bounds], dtype=jnp.bool_)
+        else:
+            bbox_terms = jnp.zeros(0, dtype=jnp.bool_)
+
         done = timeout | extra_done
 
         step_info = {}
@@ -322,8 +399,10 @@ class MJXVectorAviary:
             step_info["reward_terms"] = self._compute_terms_fn(data, action, state.task_state)
         if self._num_task_metrics > 0:
             step_info["task_metrics"] = self._task.task_metrics(new_task_state)
+        if self._num_episode_task_metrics > 0:
+            step_info["episode_task_metrics"] = self._task.task_episode_metrics(new_task_state)
         step_info["terminations"] = jnp.concatenate(
-            [jnp.array([timeout], dtype=jnp.bool_), plugin_terms]
+            [jnp.array([timeout], dtype=jnp.bool_), plugin_terms, bbox_terms]
         )
 
         new_state = MJXState(
@@ -368,7 +447,9 @@ class MJXVectorAviary:
             reset_info["reward_terms"] = jnp.zeros(self._num_terms)
         if self._num_task_metrics > 0:
             reset_info["task_metrics"] = jnp.zeros(self._num_task_metrics)
-        reset_info["terminations"] = jnp.zeros(1 + self._num_terminations, dtype=jnp.bool_)
+        if self._num_episode_task_metrics > 0:
+            reset_info["episode_task_metrics"] = jnp.zeros(self._num_episode_task_metrics)
+        reset_info["terminations"] = jnp.zeros(1 + self._num_terminations + self._num_bbox_terms, dtype=jnp.bool_)
         return MJXState(
             mjx_data=data,
             step_count=jnp.int32(0),
