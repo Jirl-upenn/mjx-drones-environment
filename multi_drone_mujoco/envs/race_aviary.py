@@ -25,6 +25,7 @@ class RaceAviary(BaseAviary):
         gates=None,
         gate_radius: float = 0.2,
         gate_normals=None,
+        gate_side: float = 1.0,
         initial_xyzs=None,
         render_mode=None,
         extra_worldbody_xml: str = "",
@@ -46,9 +47,9 @@ class RaceAviary(BaseAviary):
         else:
             self.GATES = np.array(gates)
 
-        # Unit normals pointing against travel direction, one per gate.
-        # When provided, _computeReward uses plane-crossing detection (matches MJX training).
+        # Gate geometry for plane-crossing detection (matches MJX training).
         self.GATE_NORMALS = np.array(gate_normals, dtype=np.float32) if gate_normals is not None else None
+        self._gate_half   = gate_side * 0.5
         self.gates_passed = None
         self._prev_gate_x = None  # sign of (pos - gate_pos) · normal, previous step
 
@@ -111,14 +112,20 @@ class RaceAviary(BaseAviary):
             dist = np.linalg.norm(rel)
 
             if self.GATE_NORMALS is not None:
-                # Plane-crossing detection: matches MJX plugin (sign change of x_wrt_gate
-                # while within 1 m of gate center).
+                # Plane-crossing detection matching MJX plugin:
+                #   x: sign change of dot(rel, normal) while within gate frame
+                #   y (lateral): |rel[1]*nx - rel[0]*ny|  — cross product z-component;
+                #      works because gate normals are horizontal (nz≈0)
+                #   z: world z distance (gate z-axis == world z-axis)
                 normal = self.GATE_NORMALS[gate_idx]
                 x_wrt_gate = float(np.dot(rel, normal))
+                y_wrt_gate = abs(float(rel[1] * normal[0] - rel[0] * normal[1]))
+                z_wrt_gate = abs(float(rel[2]))
                 just_passed = (
                     x_wrt_gate < 0.0
                     and self._prev_gate_x[i] > 0.0
-                    and dist < 1.0
+                    and y_wrt_gate < self._gate_half
+                    and z_wrt_gate < self._gate_half
                 )
                 # After crossing, reset x so re-entry from behind doesn't re-trigger.
                 self._prev_gate_x[i] = 1.0 if just_passed else x_wrt_gate
