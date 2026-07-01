@@ -417,7 +417,7 @@ class MJXVectorAviary:
         data = mjx.put_data(self._mj_model, mujoco.MjData(self._mj_model))
         reset_hint = None
         if self._custom_reset_fn is not None:
-            result = self._custom_reset_fn(data, rng)
+            result = self._custom_reset_fn(data, rng, state.task_state)
             if isinstance(result, tuple):
                 data, reset_hint = result
             else:
@@ -437,7 +437,7 @@ class MJXVectorAviary:
         data = mjx.forward(self._mjx_model, data)
 
         rng, task_rng = jax.random.split(rng)
-        task_state = self._task.reset_task_state(data, task_rng, reset_hint)
+        task_state = self._task.reset_task_state(data, task_rng, reset_hint, state.task_state)
 
         reset_info = {}
         if self._num_terms > 0:
