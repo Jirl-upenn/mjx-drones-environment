@@ -34,6 +34,7 @@ from typing import Any, Dict, NamedTuple, Optional, Tuple
 import numpy as np
 
 from .plugins import TaskPlugin
+from multi_drone_mujoco.utils.mixer import mix_attitude_rpm, mix_rpm_action
 
 # Lazy imports for JAX/MJX (only required at runtime)
 _JAX_AVAILABLE = False
@@ -327,19 +328,9 @@ class MJXVectorAviary:
     def _single_step(self, state: MJXState, action: Any) -> Tuple[MJXState, Any, Any, Any]:
         """Step a single environment (vmapped over batch)."""
         if self._action_type == "attitude":
-            # action = [thrust_norm, roll, pitch, yaw_rate] each in [-1, 1]
-            # thrust_norm=0 → hover_rpm (neutral hover); ±1 → ±30% of hover_rpm collective
-            collective = self.hover_rpm + 0.3 * self.hover_rpm * action[0]
-            scale = 0.02 * self.hover_rpm  # ~289 RPM max differential per axis
-            rpm = jnp.clip(jnp.array([
-                collective + action[1] * scale - action[2] * scale - action[3] * scale,
-                collective - action[1] * scale - action[2] * scale + action[3] * scale,
-                collective - action[1] * scale + action[2] * scale - action[3] * scale,
-                collective + action[1] * scale + action[2] * scale + action[3] * scale,
-            ]), 0.0, self.max_rpm)
+            rpm = mix_attitude_rpm(jnp, action, self.hover_rpm, self.max_rpm)
         else:  # "rpm"
-            # action=0 → hover_rpm; ±1 → hover_rpm ± (max_rpm - hover_rpm)
-            rpm = self.hover_rpm + action * (self.max_rpm - self.hover_rpm)
+            rpm = mix_rpm_action(jnp, action, self.hover_rpm, self.max_rpm)
 
         # Compute forces from RPM
         forces = self.kf * rpm ** 2

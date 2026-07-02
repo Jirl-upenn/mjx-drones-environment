@@ -17,6 +17,7 @@ import numpy as np
 from gymnasium import spaces
 
 from multi_drone_mujoco.utils.enums import DroneModel, Physics, ActionType, ObservationType, ImageType
+from multi_drone_mujoco.utils.mixer import mix_attitude_rpm, mix_rpm_action
 
 # Paths
 # CF2 mesh files (.obj) are vendored under multi_drone_mujoco/assets/cf2.
@@ -910,30 +911,21 @@ class BaseAviary(gym.Env):
             return np.clip(rpms, 0, self.MAX_RPM)
 
         elif self.ACT_TYPE == ActionType.ATTITUDE:
-            # [thrust_normalized, roll, pitch, yaw_rate] → RPMs via mixer
-            # Matches MJXVectorAviary._single_step attitude formula exactly:
-            #   collective = hover_rpm ± 30 %,  differential scale = 2 % of hover_rpm
+            # [thrust_normalized, roll, pitch, yaw_rate] → RPMs via the mixer
+            # shared with MJXVectorAviary._single_step (multi_drone_mujoco.utils.mixer)
+            # — kept in one place so this CPU path can't silently drift out of
+            # sync with the MJX training physics again.
             action = np.array(action).reshape(self.NUM_DRONES, 4)
             rpms = np.zeros((self.NUM_DRONES, 4))
             for i in range(self.NUM_DRONES):
-                thrust_norm, roll_cmd, pitch_cmd, yaw_rate_cmd = action[i]
-                collective_rpm = self.HOVER_RPM + 0.3 * self.HOVER_RPM * thrust_norm
-                scale = 0.02 * self.HOVER_RPM
-                rpms[i, 0] = collective_rpm + roll_cmd * scale - pitch_cmd * scale - yaw_rate_cmd * scale
-                rpms[i, 1] = collective_rpm - roll_cmd * scale - pitch_cmd * scale + yaw_rate_cmd * scale
-                rpms[i, 2] = collective_rpm - roll_cmd * scale + pitch_cmd * scale - yaw_rate_cmd * scale
-                rpms[i, 3] = collective_rpm + roll_cmd * scale + pitch_cmd * scale + yaw_rate_cmd * scale
-            return np.clip(rpms, 0, self.MAX_RPM)
+                rpms[i, :] = mix_attitude_rpm(np, action[i], self.HOVER_RPM, self.MAX_RPM)
+            return rpms
 
         raise ValueError(f"Unknown action type: {self.ACT_TYPE}")
 
     def _normalizedActionToRPM(self, action):
         """Convert [-1, 1] normalized action to [0, MAX_RPM]."""
-        return np.where(
-            action <= 0,
-            (action + 1) * self.HOVER_RPM,
-            self.HOVER_RPM + (self.MAX_RPM - self.HOVER_RPM) * action,
-        )
+        return mix_rpm_action(np, action, self.HOVER_RPM, self.MAX_RPM)
 
     ############################################################################
     # SPACES (default implementations, overridden by subclasses)
