@@ -56,7 +56,9 @@ class CurriculumWrapper(gym.Wrapper):
     ...     if level >= 5:
     ...         env.wind_speed = (level - 5) * 0.5
     ...
-    >>> env = CurriculumWrapper(HoverAviary(), difficulty_fn=adjust_difficulty)
+    >>> from multi_drone_mujoco.envs.task_aviary import TaskAviary
+    >>> from multi_drone_mujoco.envs.example_plugins import SimpleHoverPlugin
+    >>> env = CurriculumWrapper(TaskAviary(plugin=SimpleHoverPlugin()), difficulty_fn=adjust_difficulty)
     """
 
     def __init__(

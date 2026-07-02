@@ -4,8 +4,14 @@ import numpy as np
 import pytest
 
 from multi_drone_mujoco.envs.base_aviary import BaseAviary
-from multi_drone_mujoco.envs.hover_aviary import HoverAviary
+from multi_drone_mujoco.envs.task_aviary import TaskAviary
+from multi_drone_mujoco.envs.example_plugins import SimpleHoverPlugin
 from multi_drone_mujoco.utils.enums import Physics
+
+
+def HoverAviary(**kwargs):
+    kwargs.setdefault("episode_len_sec", 10.0)
+    return TaskAviary(plugin=SimpleHoverPlugin(), **kwargs)
 from multi_drone_mujoco.wrappers import DomainRandomizationWrapper, DomainRandomizationConfig
 from multi_drone_mujoco.wrappers.wind import WindField, WindConfig, WindModel
 from multi_drone_mujoco.wrappers.obstacles import (

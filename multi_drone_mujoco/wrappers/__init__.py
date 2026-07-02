@@ -58,11 +58,12 @@ class DomainRandomizationWrapper(gym.Wrapper):
 
     Example
     -------
-    >>> from multi_drone_mujoco.envs.hover_aviary import HoverAviary
+    >>> from multi_drone_mujoco.envs.task_aviary import TaskAviary
+    >>> from multi_drone_mujoco.envs.example_plugins import SimpleHoverPlugin
     >>> from multi_drone_mujoco.wrappers.domain_randomization import (
     ...     DomainRandomizationWrapper, DomainRandomizationConfig)
     >>> config = DomainRandomizationConfig(mass_range=(0.7, 1.3))
-    >>> env = DomainRandomizationWrapper(HoverAviary(), config)
+    >>> env = DomainRandomizationWrapper(TaskAviary(plugin=SimpleHoverPlugin()), config)
     >>> obs, info = env.reset()
     """
 

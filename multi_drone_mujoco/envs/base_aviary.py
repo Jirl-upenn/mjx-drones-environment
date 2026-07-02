@@ -255,7 +255,7 @@ def _generate_aviary_xml(
   <worldbody>
     <light pos="0 0 3" dir="0 0 -1" directional="true" castshadow="false"/>
     <geom name="floor" size="10 10 0.05" type="plane" material="groundplane" contype="1" conaffinity="1"/>
-{extra_worldbody_xml}{drone_bodies}{obstacle_bodies}
+{drone_bodies}{extra_worldbody_xml}{obstacle_bodies}
   </worldbody>
 
   <sensor>
@@ -582,6 +582,11 @@ class BaseAviary(gym.Env):
         # Record frames
         if self.RECORD and self.step_counter % max(1, int(self.SIM_FREQ / 24)) == 0:
             self._saveFrame()
+
+        # Task-specific per-step bookkeeping that must run exactly once,
+        # regardless of which reward/obs function ends up being called
+        # (e.g. TaskAviary's gate-crossing detection) — before obs/reward.
+        self._postPhysicsStep()
 
         # Compute returns
         obs = self._computeObs()
@@ -978,6 +983,11 @@ class BaseAviary(gym.Env):
     ############################################################################
     # COMPUTE METHODS (to be overridden by subclasses)
     ############################################################################
+
+    def _postPhysicsStep(self):
+        """Hook called once per step, after kinematics update, before
+        _computeObs/_computeReward. Override in subclass. Default: no-op."""
+        return None
 
     def _computeObs(self):
         """Compute observation."""

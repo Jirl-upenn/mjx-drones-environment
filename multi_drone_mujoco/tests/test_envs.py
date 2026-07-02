@@ -5,13 +5,18 @@ import pytest
 import gymnasium as gym
 
 from multi_drone_mujoco.envs.base_aviary import BaseAviary
-from multi_drone_mujoco.envs.hover_aviary import HoverAviary
-from multi_drone_mujoco.envs.velocity_aviary import VelocityAviary
-from multi_drone_mujoco.envs.multi_hover_aviary import MultiHoverAviary
-from multi_drone_mujoco.envs.fly_through_aviary import FlyThroughAviary
-from multi_drone_mujoco.envs.formation_aviary import FormationAviary
-from multi_drone_mujoco.envs.race_aviary import RaceAviary
+from multi_drone_mujoco.envs.task_aviary import TaskAviary
+from multi_drone_mujoco.envs.example_plugins import SimpleHoverPlugin, SimpleRacePlugin
 from multi_drone_mujoco.utils.enums import Physics, ActionType
+
+
+def HoverAviary(**kwargs):
+    kwargs.setdefault("episode_len_sec", 10.0)
+    return TaskAviary(plugin=SimpleHoverPlugin(), **kwargs)
+
+
+def RaceAviary(**kwargs):
+    return TaskAviary(plugin=SimpleRacePlugin(), **kwargs)
 
 
 class TestBaseAviary:
@@ -94,38 +99,6 @@ class TestHoverAviary:
             done = term or trunc
             steps += 1
         assert done
-        env.close()
-
-
-class TestVelocityAviary:
-    def test_obs_shape(self):
-        env = VelocityAviary()
-        obs, _ = env.reset()
-        assert obs.shape == (16,)
-        env.close()
-
-
-class TestMultiHoverAviary:
-    def test_obs_shape(self):
-        env = MultiHoverAviary(num_drones=3)
-        obs, _ = env.reset()
-        assert obs.shape == (39,)
-        env.close()
-
-
-class TestFlyThroughAviary:
-    def test_obs_shape(self):
-        env = FlyThroughAviary()
-        obs, _ = env.reset()
-        assert obs.shape == (18,)
-        env.close()
-
-
-class TestFormationAviary:
-    def test_obs_shape(self):
-        env = FormationAviary(num_drones=3)
-        obs, _ = env.reset()
-        assert obs.shape == (54,)
         env.close()
 
 

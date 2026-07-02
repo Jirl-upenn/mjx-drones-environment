@@ -6,13 +6,18 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
 # Import all environments
-from multi_drone_mujoco.envs.hover_aviary import HoverAviary
-from multi_drone_mujoco.envs.velocity_aviary import VelocityAviary
-from multi_drone_mujoco.envs.fly_through_aviary import FlyThroughAviary
-from multi_drone_mujoco.envs.race_aviary import RaceAviary
-from multi_drone_mujoco.envs.multi_hover_aviary import MultiHoverAviary
-from multi_drone_mujoco.envs.formation_aviary import FormationAviary
+from multi_drone_mujoco.envs.task_aviary import TaskAviary
+from multi_drone_mujoco.envs.example_plugins import SimpleHoverPlugin, SimpleRacePlugin
 # from multi_drone_mujoco.envs.multi_agent_aviary import MultiAgentAviary
+
+
+def HoverAviary(**kwargs):
+    kwargs.setdefault("episode_len_sec", 10.0)
+    return TaskAviary(plugin=SimpleHoverPlugin(), **kwargs)
+
+
+def RaceAviary(**kwargs):
+    return TaskAviary(plugin=SimpleRacePlugin(num_drones=kwargs.get("num_drones", 1)), **kwargs)
 
 def train_env(env_name, env_class, env_kwargs=None, algo=PPO, total_timesteps=10000000, n_envs=4):
     """
@@ -63,14 +68,9 @@ def main():
     # Setup the environments to train.
     # Note: MultiAgentAviary is excluded here because it uses PettingZoo ParallelEnv
     # and requires a MARL-specific wrapper (e.g. SuperSuit) to train with SB3.
-    # The other multi-drone envs use Centralized Control (a single large action space).
     envs_to_train = [
         ("HoverAviary", HoverAviary, {}),
-        ("VelocityAviary", VelocityAviary, {}),
-        ("FlyThroughAviary", FlyThroughAviary, {}),
         ("RaceAviary", RaceAviary, {"num_drones": 1}),
-        ("MultiHoverAviary", MultiHoverAviary, {"num_drones": 2}),
-        ("FormationAviary", FormationAviary, {"num_drones": 3}),
     ]
     
     # For a full scale run, you should set steps to 10M-50M.

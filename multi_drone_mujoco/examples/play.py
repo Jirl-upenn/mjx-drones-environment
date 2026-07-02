@@ -9,7 +9,7 @@ import argparse
 import numpy as np
 
 
-def play(model_path: str, env_type: str = "hover", episodes: int = 3, save_rgb: str = None):
+def play(model_path: str, episodes: int = 3, save_rgb: str = None):
     """Load and visualize a trained policy."""
     try:
         from stable_baselines3 import PPO
@@ -17,17 +17,18 @@ def play(model_path: str, env_type: str = "hover", episodes: int = 3, save_rgb: 
         print("[ERROR] stable-baselines3 not installed.")
         return
 
-    from multi_drone_mujoco.envs.hover_aviary import HoverAviary
-    from multi_drone_mujoco.envs.multi_hover_aviary import MultiHoverAviary
+    from multi_drone_mujoco.envs.task_aviary import TaskAviary
+    from multi_drone_mujoco.envs.example_plugins import SimpleHoverPlugin
+
+    def HoverAviary(**kwargs):
+        kwargs.setdefault("episode_len_sec", 10.0)
+        return TaskAviary(plugin=SimpleHoverPlugin(), **kwargs)
 
     print(f"Loading model from: {model_path}")
     model = PPO.load(model_path)
 
     render_mode = "rgb_array" if save_rgb else None
-    if env_type == "multi":
-        env = MultiHoverAviary(num_drones=2, ctrl_freq=48, sim_freq=240, render_mode=render_mode)
-    else:
-        env = HoverAviary(ctrl_freq=48, sim_freq=240, render_mode=render_mode)
+    env = HoverAviary(ctrl_freq=48, sim_freq=240, render_mode=render_mode)
 
     writer = None
     if save_rgb:
@@ -69,9 +70,8 @@ def play(model_path: str, env_type: str = "hover", episodes: int = 3, save_rgb: 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--env_type", type=str, default="hover")
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--save_rgb", type=str, default=None, metavar="OUTPUT.mp4",
                         help="Save rollout as a video file using cv2 (e.g. output.mp4)")
     args = parser.parse_args()
-    play(args.model_path, args.env_type, args.episodes, args.save_rgb)
+    play(args.model_path, args.episodes, args.save_rgb)

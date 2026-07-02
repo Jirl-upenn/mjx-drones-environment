@@ -2,7 +2,14 @@ import os
 import gymnasium as gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import EvalCallback
-from multi_drone_mujoco.envs.hover_aviary import HoverAviary
+from multi_drone_mujoco.envs.task_aviary import TaskAviary
+from multi_drone_mujoco.envs.example_plugins import SimpleHoverPlugin
+
+
+def HoverAviary(**kwargs):
+    kwargs.setdefault("episode_len_sec", 10.0)
+    return TaskAviary(plugin=SimpleHoverPlugin(), **kwargs)
+
 
 def main():
     print("="*60)
@@ -11,7 +18,7 @@ def main():
 
     # Create the training environment
     env = HoverAviary(record=False, gui=False)
-    
+
     # Create the evaluation environment
     eval_env = HoverAviary(record=False, gui=False)
     

@@ -18,7 +18,8 @@ class WindWrapper(gym.Wrapper):
 
     Example
     -------
-    >>> from multi_drone_mujoco.envs.hover_aviary import HoverAviary
+    >>> from multi_drone_mujoco.envs.task_aviary import TaskAviary
+    >>> from multi_drone_mujoco.envs.example_plugins import SimpleHoverPlugin
     >>> from multi_drone_mujoco.wrappers.wind import WindConfig, WindModel
     >>> from multi_drone_mujoco.wrappers.wind_wrapper import WindWrapper
     >>> config = WindConfig(
@@ -27,7 +28,7 @@ class WindWrapper(gym.Wrapper):
     ...     turbulence_intensity=1.5,
     ...     gust_intensity=0.01,
     ... )
-    >>> env = WindWrapper(HoverAviary(), config)
+    >>> env = WindWrapper(TaskAviary(plugin=SimpleHoverPlugin()), config)
     >>> obs, _ = env.reset()
     """
 

@@ -62,9 +62,10 @@ env.close()
 
 ```python
 from stable_baselines3 import PPO
-from multi_drone_mujoco.envs.hover_aviary import HoverAviary
+from multi_drone_mujoco.envs.task_aviary import TaskAviary
+from multi_drone_mujoco.envs.example_plugins import SimpleHoverPlugin
 
-env = HoverAviary(ctrl_freq=48)
+env = TaskAviary(plugin=SimpleHoverPlugin(), ctrl_freq=48, episode_len_sec=10.0)
 model = PPO("MlpPolicy", env, verbose=1)
 model.learn(total_timesteps=500_000)
 model.save("hover_ppo")
@@ -87,20 +88,23 @@ obs, rewards, terms, truncs, infos = env.step(actions)
 cd multi_drone_mujoco/examples/
 python pid.py          # PID hover + velocity tracking + multi-drone
 python downwash.py     # downwash effect demonstration
-python learn.py        # SB3 PPO training (single + multi hover)
+python learn.py        # SB3 PPO training (hover)
 python play.py         # visualize trained policy
 ```
 
 ## Environments
 
-| Environment | Obs Dim | Action | Description |
+All task-specific behavior (observations, reward, reset, termination) is
+supplied by a `CPUTaskPlugin` passed to the generic `TaskAviary` — see
+`multi_drone_mujoco/envs/plugins.py` for the interface and
+`multi_drone_mujoco/envs/example_plugins.py` for reference implementations.
+Bring your own plugin from any repo to define a new task without touching
+this package.
+
+| Plugin | Obs Dim | Action | Description |
 |---|---|---|---|
-| `HoverAviary` | 12 | 4 (normalized RPM) | Hover at z=1.0 |
-| `VelocityAviary` | 16 | 4 (normalized RPM) | Track velocity commands |
-| `MultiHoverAviary` | 13×N | 4×N | N drones at different heights |
-| `FlyThroughAviary` | 18 | 4 | Navigate through waypoints |
-| `FormationAviary` | 18×N | 4×N | Formation flying along a path |
-| `RaceAviary` | 21 | 4 | Gate racing with lap timing |
+| `SimpleHoverPlugin` | 12 | 4 (normalized RPM) | Hover at a fixed target height |
+| `SimpleRacePlugin` | 21×N | 4×N | Gate racing with lap timing |
 | `MultiAgentAviary` | per-agent | per-agent | PettingZoo parallel wrapper |
 
 ## Physics Modes
@@ -126,12 +130,9 @@ pytest multi_drone_mujoco/tests/ -v
 multi_drone_mujoco/
 ├── envs/
 │   ├── base_aviary.py          # Core physics engine + Gymnasium env
-│   ├── hover_aviary.py         # Single-drone hover task
-│   ├── velocity_aviary.py      # Velocity tracking task
-│   ├── multi_hover_aviary.py   # Multi-drone hover
-│   ├── fly_through_aviary.py   # Waypoint navigation
-│   ├── formation_aviary.py     # Formation flying
-│   ├── race_aviary.py          # Gate racing
+│   ├── plugins.py              # CPUTaskPlugin interface (bring your own task)
+│   ├── task_aviary.py          # Generic TaskAviary — all task logic via a plugin
+│   ├── example_plugins.py      # SimpleHoverPlugin / SimpleRacePlugin reference plugins
 │   └── multi_agent_aviary.py   # PettingZoo wrapper
 ├── control/
 │   ├── pid_control.py          # Cascaded PID controller
