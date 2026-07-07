@@ -461,7 +461,7 @@ class MJXVectorAviary:
     <body name="drone{d}" pos="{x_offset} 0 0.115">
       <freejoint name="drone{d}_joint"/>
       <inertial pos="0 0 0" mass="{mass}" diaginertia="{ixx} {iyy} {izz}"/>
-      <geom type="cylinder" size="0.04 0.007" rgba="1 1 1 1" contype="1" conaffinity="1"/>
+      <geom type="cylinder" size="0.04 0.007" rgba="1 1 1 1" contype="0" conaffinity="0"/>
       <geom type="capsule" fromto="0 0 0  {a:.3f}  {a:.3f} 0" size="0.006" rgba="1 1 1 1" contype="0" conaffinity="0"/>
       <geom type="capsule" fromto="0 0 0 -{a:.3f}  {a:.3f} 0" size="0.006" rgba="1 1 1 1" contype="0" conaffinity="0"/>
       <geom type="capsule" fromto="0 0 0  {a:.3f} -{a:.3f} 0" size="0.006" rgba="1 1 1 1" contype="0" conaffinity="0"/>
@@ -491,7 +491,7 @@ class MJXVectorAviary:
     <light pos="0 0 5" dir="0 0 -1" diffuse="1.0 1.0 0.95" specular="0.6 0.6 0.5" directional="true"/>
     <light pos="4 2 4" dir="-1 -0.5 -1" diffuse="0.5 0.5 0.5" specular="0.1 0.1 0.1" directional="true"/>
     <light pos="-2 4 3" dir="0.5 -1 -1" diffuse="0.35 0.35 0.35" directional="true"/>
-    <geom name="floor" size="2 2 0.05" type="plane" rgba="0.15 0.30 0.65 1" contype="1" conaffinity="1"/>
+    <geom name="floor" size="2 2 0.05" type="plane" rgba="0.15 0.30 0.65 1" contype="0" conaffinity="0"/>
 {drones}{extra_worldbody}
   </worldbody>
 </mujoco>"""

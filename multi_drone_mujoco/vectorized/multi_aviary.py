@@ -128,6 +128,7 @@ class MultiVectorAviary:
 
         self.num_envs = num_envs
         self.num_drones = num_drones
+        self._body_ids = jnp.arange(1, num_drones + 1)  # drone{d} -> body 1+d, see _body_id
         self.task = task
         self.sim_freq = sim_freq
         self.ctrl_freq = ctrl_freq
@@ -254,30 +255,31 @@ class MultiVectorAviary:
     def _single_step(self, state: MJXState, action: Any) -> Tuple[MJXState, Any, Any, Any]:
         """action: (num_drones, act_dim_per_drone) for a single env (vmapped over batch)."""
         data = state.mjx_data
+        body_ids = self._body_ids
+
+        if self._action_type == "attitude":
+            rpm = vmap(mix_attitude_rpm, in_axes=(None, 0, None, None))(
+                jnp, action, self.hover_rpm, self.max_rpm)
+        else:
+            # Elementwise mixer — already broadcasts over the leading drone axis.
+            rpm = mix_rpm_action(jnp, action, self.hover_rpm, self.max_rpm)
+
+        forces = self.kf * rpm ** 2                      # (num_drones, 4)
+        total_thrust = jnp.sum(forces, axis=-1)           # (num_drones,)
+
+        xmat = data.xmat[body_ids].reshape(self.num_drones, 3, 3)
+        thrust_world = xmat[:, :, 2] * total_thrust[:, None]  # xmat @ [0,0,T] == T * z-column
+
+        L, s2 = self.arm_length, jnp.sqrt(2.0)
+        tau_x = (forces[:, 0] + forces[:, 1] - forces[:, 2] - forces[:, 3]) * L / s2
+        tau_y = (-forces[:, 0] + forces[:, 1] + forces[:, 2] - forces[:, 3]) * L / s2
+        tau_z = (-forces[:, 0] + forces[:, 1] - forces[:, 2] + forces[:, 3]) * self.km / self.kf
+        torque_body = jnp.stack([tau_x, tau_y, tau_z], axis=-1)        # (num_drones, 3)
+        torque_world = jnp.einsum("nij,nj->ni", xmat, torque_body)
+
         xfrc = jnp.zeros_like(data.xfrc_applied)
-
-        for d in range(self.num_drones):
-            a = action[d]
-            if self._action_type == "attitude":
-                rpm = mix_attitude_rpm(jnp, a, self.hover_rpm, self.max_rpm)
-            else:
-                rpm = mix_rpm_action(jnp, a, self.hover_rpm, self.max_rpm)
-
-            forces = self.kf * rpm ** 2
-            total_thrust = jnp.sum(forces)
-
-            body_id = self._body_id(d)
-            xmat = data.xmat[body_id].reshape(3, 3)
-            thrust_world = xmat @ jnp.array([0.0, 0.0, total_thrust])
-
-            L, s2 = self.arm_length, jnp.sqrt(2.0)
-            tau_x = (forces[0] + forces[1] - forces[2] - forces[3]) * L / s2
-            tau_y = (-forces[0] + forces[1] + forces[2] - forces[3]) * L / s2
-            tau_z = (-forces[0] + forces[1] - forces[2] + forces[3]) * self.km / self.kf
-            torque_world = xmat @ jnp.array([tau_x, tau_y, tau_z])
-
-            xfrc = xfrc.at[body_id, :3].set(thrust_world)
-            xfrc = xfrc.at[body_id, 3:].set(torque_world)
+        xfrc = xfrc.at[body_ids, :3].set(thrust_world)
+        xfrc = xfrc.at[body_ids, 3:].set(torque_world)
 
         data = data.replace(xfrc_applied=xfrc)
 
@@ -362,7 +364,7 @@ class MultiVectorAviary:
     <body name="drone{d}" pos="{x_offset} 0 0.115">
       <freejoint name="drone{d}_joint"/>
       <inertial pos="0 0 0" mass="{mass}" diaginertia="{ixx} {iyy} {izz}"/>
-      <geom type="cylinder" size="0.04 0.007" rgba="1 1 1 1" contype="1" conaffinity="1"/>
+      <geom type="cylinder" size="0.04 0.007" rgba="1 1 1 1" contype="0" conaffinity="0"/>
       <geom type="capsule" fromto="0 0 0  {a:.3f}  {a:.3f} 0" size="0.006" rgba="1 1 1 1" contype="0" conaffinity="0"/>
       <geom type="capsule" fromto="0 0 0 -{a:.3f}  {a:.3f} 0" size="0.006" rgba="1 1 1 1" contype="0" conaffinity="0"/>
       <geom type="capsule" fromto="0 0 0  {a:.3f} -{a:.3f} 0" size="0.006" rgba="1 1 1 1" contype="0" conaffinity="0"/>
@@ -392,7 +394,7 @@ class MultiVectorAviary:
     <light pos="0 0 5" dir="0 0 -1" diffuse="1.0 1.0 0.95" specular="0.6 0.6 0.5" directional="true"/>
     <light pos="4 2 4" dir="-1 -0.5 -1" diffuse="0.5 0.5 0.5" specular="0.1 0.1 0.1" directional="true"/>
     <light pos="-2 4 3" dir="0.5 -1 -1" diffuse="0.35 0.35 0.35" directional="true"/>
-    <geom name="floor" size="2 2 0.05" type="plane" rgba="0.15 0.30 0.65 1" contype="1" conaffinity="1"/>
+    <geom name="floor" size="2 2 0.05" type="plane" rgba="0.15 0.30 0.65 1" contype="0" conaffinity="0"/>
 {drones}{extra_worldbody}
   </worldbody>
 </mujoco>"""

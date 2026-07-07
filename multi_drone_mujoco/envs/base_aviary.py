@@ -185,7 +185,7 @@ def _generate_aviary_xml(
       <geom mesh="cf2_vis_3" material="polished_plastic" class="visual"/>
       <geom mesh="cf2_vis_4" material="burnished_chrome" class="visual"/>
       <geom mesh="cf2_vis_5" material="body_frame_plastic" class="visual"/>
-      <geom mesh="cf2_vis_6" material="white" class="visual"/>
+      <geom name="{prefix}_accent" mesh="cf2_vis_6" rgba="1 1 1 1" class="visual"/>
       <site name="{prefix}_center" pos="0 0 0" group="5"/>
 {prop_sites}"""
 
