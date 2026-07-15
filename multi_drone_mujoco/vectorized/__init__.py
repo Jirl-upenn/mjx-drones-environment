@@ -297,7 +297,19 @@ class MJXVectorAviary:
         """
         action = jnp.clip(action, -1.0, 1.0)
         next_state, obs, reward, done = self._step_fn(state, action)
-        info = next_state.info
+        # Shallow-copied, not mutated in place: next_state.info is about to
+        # be fed into self._reset_fn/tree_map below (to build the carried
+        # final_state), so it must keep its original key set — the extra
+        # "true_final_obs" key only belongs on the dict this method returns.
+        info = dict(next_state.info)
+        # True post-step observation, before any auto-reset overwrite below —
+        # needed so callers can bootstrap a value estimate from the actual
+        # state a "done" transition landed in (e.g. an episode-length
+        # timeout, which isn't a real terminal state) rather than from the
+        # unrelated freshly-reset episode's start state that `obs` itself
+        # gets overwritten with further down for done envs. Always present,
+        # identical to `obs` itself for envs that didn't reset this step.
+        info["true_final_obs"] = obs
 
         if self._death_cost != 0.0:
             terminations = info["terminations"]

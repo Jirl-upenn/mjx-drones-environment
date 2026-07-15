@@ -101,6 +101,13 @@ class MultiVectorAviary:
     action_type : {"rpm", "attitude"}
         Same per-drone mixer as the single-agent aviary; applied independently
         to each drone's own 4-dim action slice.
+    bounding_box : (hx, hy, hz) or None
+        Generic workspace bounding box, mirroring MJXVectorAviary's own —
+        episode terminates if ANY agent's position exits ±hx, ±hy, or [*, hz]
+        (joint termination, same semantics as the plugin's own extra_done
+        conditions like a lap limit: one agent diverging arbitrarily far off
+        the track ends the episode for the whole group rather than letting
+        the rest keep racing around it). None disables the check entirely.
     """
 
     def __init__(
@@ -114,6 +121,7 @@ class MultiVectorAviary:
         episode_length: int = 1440,
         reset_fn=None,
         action_type: str = "rpm",
+        bounding_box: Optional[Tuple[float, float, float]] = None,
     ):
         _check_deps()
         if plugin is None:
@@ -139,6 +147,8 @@ class MultiVectorAviary:
             raise ValueError(f"action_type must be 'rpm' or 'attitude', got {action_type!r}")
         self._action_type = action_type
         self._custom_reset_fn = reset_fn
+        self._bounding_box = bounding_box
+        self._num_bbox_terms: int = 1 if bounding_box is not None else 0
 
         # Physical constants (Crazyflie 2.x) — identical to MJXVectorAviary.
         self.mass = 0.027
@@ -185,7 +195,10 @@ class MultiVectorAviary:
 
     @property
     def termination_names(self) -> list:
-        return ["timeout"] + list(getattr(self._task, 'termination_names', []))
+        names = ["timeout"] + list(getattr(self._task, 'termination_names', []))
+        if self._bounding_box is not None:
+            names += ["out_of_bounds"]
+        return names
 
     class _Space:
         def __init__(self, shape: tuple):
@@ -221,7 +234,22 @@ class MultiVectorAviary:
         done: (num_envs,) — shared/joint termination, plugin-determined."""
         action = jnp.clip(action, -1.0, 1.0)
         next_state, obs, reward, done = self._step_fn(state, action)
-        info = next_state.info
+        # Shallow-copied, not mutated in place: next_state.info is about to
+        # be fed into self._reset_fn/tree_map below (to build the carried
+        # final_state), so it must keep its original key set — the extra
+        # "true_final_obs" key only belongs on the dict this method returns.
+        # See vectorized/__init__.py's MJXVectorAviary.step for the full
+        # rationale (bootstrapping a value estimate from a timeout-ended
+        # episode's real end state, not the unrelated reset state).
+        info = dict(next_state.info)
+        info["true_final_obs"] = obs
+        # Same rationale, for the asymmetric/centralized critic's own input
+        # (own obs ++ privileged features) — computed from next_state (the
+        # true, pre-reset state) rather than the post-reset final_state
+        # get_critic_obs() would otherwise be called on.
+        info["true_final_critic_obs"] = jnp.concatenate(
+            [obs, self.get_critic_obs(next_state)], axis=-1
+        )
 
         reset_state = self._reset_fn(next_state, keys)
         reset_obs = vmap(self._task.get_obs)(reset_state.mjx_data, reset_state.task_state)
@@ -297,6 +325,24 @@ class MultiVectorAviary:
         else:
             plugin_terms = jnp.zeros(0, dtype=jnp.bool_)
 
+        # Generic workspace bounding box — resolved at trace time, mirrors
+        # MJXVectorAviary's single-agent version. Joint termination: ANY
+        # agent out of bounds ends the episode for the whole group (same
+        # semantics as a lap-limit finish), not just the offending agent.
+        if self._bounding_box is not None:
+            positions = data.xpos[body_ids]  # (num_drones, 3)
+            hx, hy, hz = self._bounding_box
+            out_of_bounds_per_agent = (
+                (jnp.abs(positions[:, 0]) > hx)
+                | (jnp.abs(positions[:, 1]) > hy)
+                | (positions[:, 2] > hz)
+            )
+            out_of_bounds = jnp.any(out_of_bounds_per_agent)
+            extra_done = extra_done | out_of_bounds
+            bbox_terms = jnp.array([out_of_bounds], dtype=jnp.bool_)
+        else:
+            bbox_terms = jnp.zeros(0, dtype=jnp.bool_)
+
         done = timeout | extra_done
 
         step_info = {}
@@ -307,7 +353,7 @@ class MultiVectorAviary:
         if self._num_episode_task_metrics > 0:
             step_info["episode_task_metrics"] = self._task.task_episode_metrics(new_task_state)
         step_info["terminations"] = jnp.concatenate(
-            [jnp.array([timeout], dtype=jnp.bool_), plugin_terms]
+            [jnp.array([timeout], dtype=jnp.bool_), plugin_terms, bbox_terms]
         )
 
         new_state = MJXState(
@@ -340,7 +386,9 @@ class MultiVectorAviary:
             reset_info["task_metrics"] = jnp.zeros(self._num_task_metrics)
         if self._num_episode_task_metrics > 0:
             reset_info["episode_task_metrics"] = jnp.zeros(self._num_episode_task_metrics)
-        reset_info["terminations"] = jnp.zeros(1 + self._num_terminations, dtype=jnp.bool_)
+        reset_info["terminations"] = jnp.zeros(
+            1 + self._num_terminations + self._num_bbox_terms, dtype=jnp.bool_
+        )
         return MJXState(
             mjx_data=data,
             step_count=jnp.int32(0),
