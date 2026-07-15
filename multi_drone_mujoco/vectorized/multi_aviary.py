@@ -35,9 +35,12 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-from . import MJXState
+from . import MJXState, PhysParams, _INERTIA_DIAG
 from .plugins import TaskPlugin
-from multi_drone_mujoco.utils.mixer import mix_attitude_rpm, mix_rpm_action
+from multi_drone_mujoco.utils.mixer import (
+    mix_attitude_rpm, mix_rpm_action, mix_attitude_pid_rpm,
+    KP_OMEGA_RP, KI_OMEGA_RP, KD_OMEGA_RP, KP_OMEGA_Y, KI_OMEGA_Y, KD_OMEGA_Y,
+)
 
 _JAX_AVAILABLE = False
 _MJX_AVAILABLE = False
@@ -98,9 +101,10 @@ class MultiVectorAviary:
         Required (unlike MJXVectorAviary, there is no sensible generic
         default spawn for N drones) — ``(data, rng, task_state) -> mjx.Data``
         or ``(mjx.Data, hint)``, called inside vmap.
-    action_type : {"rpm", "attitude"}
+    action_type : {"rpm", "attitude", "attitude_pid"}
         Same per-drone mixer as the single-agent aviary; applied independently
-        to each drone's own 4-dim action slice.
+        to each drone's own 4-dim action slice. See vectorized/__init__.py's
+        MJXVectorAviary docstring for what each mode does.
     bounding_box : (hx, hy, hz) or None
         Generic workspace bounding box, mirroring MJXVectorAviary's own —
         episode terminates if ANY agent's position exits ±hx, ±hy, or [*, hz]
@@ -122,6 +126,13 @@ class MultiVectorAviary:
         reset_fn=None,
         action_type: str = "rpm",
         bounding_box: Optional[Tuple[float, float, float]] = None,
+        mass: float = 0.027,
+        kf: float = 3.16e-10,
+        km: float = 7.94e-12,
+        arm_length: float = 0.0397,
+        max_rpm: float = 21714.0,
+        domain_rand_fn=None,
+        motor_tau: float = 0.0,
     ):
         _check_deps()
         if plugin is None:
@@ -143,22 +154,46 @@ class MultiVectorAviary:
         self.sim_steps_per_ctrl = sim_freq // ctrl_freq
         self.episode_length = episode_length
 
-        if action_type not in ("rpm", "attitude"):
-            raise ValueError(f"action_type must be 'rpm' or 'attitude', got {action_type!r}")
+        if action_type not in ("rpm", "attitude", "attitude_pid"):
+            raise ValueError(
+                f"action_type must be 'rpm', 'attitude', or 'attitude_pid', got {action_type!r}"
+            )
         self._action_type = action_type
         self._custom_reset_fn = reset_fn
         self._bounding_box = bounding_box
         self._num_bbox_terms: int = 1 if bounding_box is not None else 0
+        self._domain_rand_fn = domain_rand_fn
+        self._motor_tau = motor_tau
 
-        # Physical constants (Crazyflie 2.x) — identical to MJXVectorAviary.
-        self.mass = 0.027
+        # Physical constants — Crazyflie 2.x by default; pass mass/kf/km/
+        # arm_length/max_rpm to simulate a different drone platform. See
+        # vectorized/__init__.py's MJXVectorAviary for the identical
+        # single-agent version of everything below.
+        self.mass = mass
         self.gravity = 9.81
-        self.kf = 3.16e-10
-        self.km = 7.94e-12
-        self.arm_length = 0.0397
-        self.max_rpm = 21714.0
+        self.kf = kf
+        self.km = km
+        self.arm_length = arm_length
+        self.max_rpm = max_rpm
         self.hover_rpm = np.sqrt((self.mass * self.gravity) / (4 * self.kf))
+        self.differential_frac = 0.02  # nominal mix_attitude_rpm gain — see PhysParams
+        # attitude_pid's rate-PID needs inertia @ angular_acceleration =
+        # commanded moment — see vectorized/__init__.py's _INERTIA_DIAG.
+        self._inertia_diag = jnp.array(_INERTIA_DIAG)
         self.act_dim_per_drone = 4
+        # Nominal per-drone dynamics — every drone uses this fixed value
+        # unless domain_rand_fn overrides it (independently per drone, not
+        # just per env — see _single_reset: each drone gets its own
+        # domain_rand_fn draw, matching real manufacturing/unit-to-unit
+        # variance between physically separate vehicles).
+        self._nominal_phys = PhysParams(
+            kf=self.kf, km=self.km, arm_length=self.arm_length,
+            max_rpm=self.max_rpm, hover_rpm=self.hover_rpm,
+            differential_frac=self.differential_frac, motor_tau=self._motor_tau,
+            # attitude_pid rate-PID gains — see PhysParams docstring.
+            kp_omega_rp=KP_OMEGA_RP, ki_omega_rp=KI_OMEGA_RP, kd_omega_rp=KD_OMEGA_RP,
+            kp_omega_y=KP_OMEGA_Y, ki_omega_y=KI_OMEGA_Y, kd_omega_y=KD_OMEGA_Y,
+        )
 
         self._gates_xyz_np = getattr(plugin, "gate_xyz_np", None)
 
@@ -224,6 +259,15 @@ class MultiVectorAviary:
             done=jnp.zeros(self.num_envs, dtype=jnp.bool_),
             info={},
             task_state=self._task.init_task_state(self.num_envs),
+            # Placeholders only — _reset_fn (_single_reset) below returns a
+            # complete new MJXState, including its own freshly-sampled
+            # phys_params/motor_rpm, so these values are never actually read.
+            phys_params=jax.tree_util.tree_map(
+                lambda x: jnp.broadcast_to(x, (self.num_envs, self.num_drones)), self._nominal_phys
+            ),
+            motor_rpm=jnp.broadcast_to(self.hover_rpm, (self.num_envs, self.num_drones, 4)),
+            pid_integral=jnp.zeros((self.num_envs, self.num_drones, 3)),
+            pid_prev_omega=jnp.zeros((self.num_envs, self.num_drones, 3)),
         )
         state = self._reset_fn(state, rngs)
         obs = vmap(self._task.get_obs)(state.mjx_data, state.task_state)
@@ -284,37 +328,81 @@ class MultiVectorAviary:
         """action: (num_drones, act_dim_per_drone) for a single env (vmapped over batch)."""
         data = state.mjx_data
         body_ids = self._body_ids
+        phys = state.phys_params  # each field shape (num_drones,) — see PhysParams
 
-        if self._action_type == "attitude":
-            rpm = vmap(mix_attitude_rpm, in_axes=(None, 0, None, None))(
-                jnp, action, self.hover_rpm, self.max_rpm)
+        if self._action_type == "attitude_pid":
+            # Computed fresh every physics substep inside _physics_step below
+            # (needs each drone's current measured angular velocity) rather
+            # than once here — see mix_attitude_pid_rpm's docstring.
+            rpm_cmd = None
+        elif self._action_type == "attitude":
+            rpm_cmd = vmap(mix_attitude_rpm, in_axes=(None, 0, 0, 0, 0))(
+                jnp, action, phys.hover_rpm, phys.max_rpm, phys.differential_frac)
         else:
-            # Elementwise mixer — already broadcasts over the leading drone axis.
-            rpm = mix_rpm_action(jnp, action, self.hover_rpm, self.max_rpm)
+            # phys.hover_rpm/max_rpm are (num_drones,) — broadcast against
+            # action's (num_drones, 4) via an explicit trailing axis (unlike
+            # the old shared-scalar case, which broadcast for free).
+            rpm_cmd = mix_rpm_action(jnp, action, phys.hover_rpm[:, None], phys.max_rpm[:, None])
 
-        forces = self.kf * rpm ** 2                      # (num_drones, 4)
-        total_thrust = jnp.sum(forces, axis=-1)           # (num_drones,)
+        L, s2 = phys.arm_length, jnp.sqrt(2.0)
+        sim_dt = 1.0 / self.sim_freq
+        # alpha=1.0 (no lag) exactly when phys.motor_tau=0 — see
+        # vectorized/__init__.py's MJXVectorAviary._single_step for the full
+        # rationale (same formula, per-drone here instead of per-env).
+        alpha = sim_dt / (phys.motor_tau + sim_dt)  # (num_drones,)
 
-        xmat = data.xmat[body_ids].reshape(self.num_drones, 3, 3)
-        thrust_world = xmat[:, :, 2] * total_thrust[:, None]  # xmat @ [0,0,T] == T * z-column
+        def _physics_step(carry, _):
+            d, motor_rpm, pid_integral, prev_omega = carry
+            xmat = d.xmat[body_ids].reshape(self.num_drones, 3, 3)
 
-        L, s2 = self.arm_length, jnp.sqrt(2.0)
-        tau_x = (forces[:, 0] + forces[:, 1] - forces[:, 2] - forces[:, 3]) * L / s2
-        tau_y = (-forces[:, 0] + forces[:, 1] + forces[:, 2] - forces[:, 3]) * L / s2
-        tau_z = (-forces[:, 0] + forces[:, 1] - forces[:, 2] + forces[:, 3]) * self.km / self.kf
-        torque_body = jnp.stack([tau_x, tau_y, tau_z], axis=-1)        # (num_drones, 3)
-        torque_world = jnp.einsum("nij,nj->ni", xmat, torque_body)
+            if self._action_type == "attitude_pid":
+                # Per-drone measured body-frame angular velocity: MJX's
+                # freejoint qvel angular component is world-frame — rotate
+                # with xmat^T (per drone), see vectorized/__init__.py's
+                # single-agent version for the same rotation the other way
+                # (xmat @ v_body -> v_world) just below.
+                omega_world = d.qvel.reshape(self.num_drones, 6)[:, 3:6]  # (num_drones, 3)
+                omega_body = jnp.einsum("nji,nj->ni", xmat, omega_world)
+                step_rpm_cmd, pid_integral, prev_omega = vmap(
+                    mix_attitude_pid_rpm,
+                    in_axes=(None, 0, 0, 0, 0, None, None, 0, 0, 0, 0, None, None,
+                             0, 0, 0, 0, 0, 0),
+                )(
+                    jnp, action, omega_body, pid_integral, prev_omega,
+                    self.mass, self.gravity, phys.kf, phys.km, phys.arm_length,
+                    phys.max_rpm, self._inertia_diag, sim_dt,
+                    phys.kp_omega_rp, phys.ki_omega_rp, phys.kd_omega_rp,
+                    phys.kp_omega_y, phys.ki_omega_y, phys.kd_omega_y,
+                )
+            else:
+                step_rpm_cmd = rpm_cmd
 
-        xfrc = jnp.zeros_like(data.xfrc_applied)
-        xfrc = xfrc.at[body_ids, :3].set(thrust_world)
-        xfrc = xfrc.at[body_ids, 3:].set(torque_world)
+            motor_rpm = alpha[:, None] * step_rpm_cmd + (1.0 - alpha[:, None]) * motor_rpm  # (num_drones, 4)
 
-        data = data.replace(xfrc_applied=xfrc)
+            forces = phys.kf[:, None] * motor_rpm ** 2        # (num_drones, 4)
+            total_thrust = jnp.sum(forces, axis=-1)           # (num_drones,)
 
-        def _physics_step(d, _):
-            return mjx.step(self._mjx_model, d), None
+            thrust_world = xmat[:, :, 2] * total_thrust[:, None]  # xmat @ [0,0,T] == T * z-column
 
-        data, _ = lax.scan(_physics_step, data, None, length=self.sim_steps_per_ctrl)
+            tau_x = (forces[:, 0] + forces[:, 1] - forces[:, 2] - forces[:, 3]) * L / s2
+            tau_y = (-forces[:, 0] + forces[:, 1] + forces[:, 2] - forces[:, 3]) * L / s2
+            tau_z = (-forces[:, 0] + forces[:, 1] - forces[:, 2] + forces[:, 3]) * phys.km / phys.kf
+            torque_body = jnp.stack([tau_x, tau_y, tau_z], axis=-1)        # (num_drones, 3)
+            torque_world = jnp.einsum("nij,nj->ni", xmat, torque_body)
+
+            xfrc = jnp.zeros_like(d.xfrc_applied)
+            xfrc = xfrc.at[body_ids, :3].set(thrust_world)
+            xfrc = xfrc.at[body_ids, 3:].set(torque_world)
+            d = d.replace(xfrc_applied=xfrc)
+
+            d = mjx.step(self._mjx_model, d)
+            return (d, motor_rpm, pid_integral, prev_omega), None
+
+        (data, motor_rpm, pid_integral, prev_omega), _ = lax.scan(
+            _physics_step,
+            (data, state.motor_rpm, state.pid_integral, state.pid_prev_omega),
+            None, length=self.sim_steps_per_ctrl,
+        )
 
         step_count = state.step_count + 1
         new_task_state, obs, reward, extra_done = self._task.step(data, action, state.task_state)
@@ -362,12 +450,27 @@ class MultiVectorAviary:
             done=done,
             info=step_info,
             task_state=new_task_state,
+            # Dynamics are fixed for the episode's duration — only resampled
+            # at reset (_single_reset), never mid-episode.
+            phys_params=phys,
+            # The lagged motor state carries forward continuously (that's
+            # the whole point of modeling lag) — not reset here.
+            motor_rpm=motor_rpm,
+            # Same continuity rationale as motor_rpm — unchanged pass-through
+            # when action_type != "attitude_pid".
+            pid_integral=pid_integral,
+            pid_prev_omega=prev_omega,
         )
         return new_state, obs, reward, done
 
     def _single_reset(self, state: MJXState, rng: Any) -> MJXState:
         data = mjx.put_data(self._mj_model, mujoco.MjData(self._mj_model))
-        result = self._custom_reset_fn(data, rng, state.task_state)
+        # Split off reset_fn's own key rather than reusing the same `rng`
+        # for phys_rng/task_rng below — see vectorized/__init__.py's
+        # MJXVectorAviary._single_reset for why reusing it would correlate
+        # rather than decorrelate them.
+        rng, reset_fn_rng = jax.random.split(rng)
+        result = self._custom_reset_fn(data, reset_fn_rng, state.task_state)
         reset_hint = None
         if isinstance(result, tuple):
             data, reset_hint = result
@@ -379,11 +482,31 @@ class MultiVectorAviary:
         rng, task_rng = jax.random.split(rng)
         task_state = self._task.reset_task_state(data, task_rng, reset_hint, state.task_state)
 
+        # Domain randomization — independent per DRONE, not just per env
+        # (real manufacturing/unit-to-unit variance is between physically
+        # separate vehicles, not shared by every drone in the same race).
+        # Reuses the exact same domain_rand_fn(rng, nominal)->PhysParams
+        # contract as the single-agent MJXVectorAviary unchanged — an outer
+        # vmap over one rng key per drone is all that's needed to turn a
+        # single-drone sampler into a per-drone one.
+        rng, phys_rng = jax.random.split(rng)
+        if self._domain_rand_fn is not None:
+            drone_rngs = jax.random.split(phys_rng, self.num_drones)
+            phys_params = vmap(self._domain_rand_fn, in_axes=(0, None))(drone_rngs, self._nominal_phys)
+        else:
+            phys_params = jax.tree_util.tree_map(
+                lambda x: jnp.broadcast_to(x, (self.num_drones,)), self._nominal_phys
+            )
+
         reset_info = {}
         if self._num_terms > 0:
             reset_info["reward_terms"] = jnp.zeros((self.num_drones, self._num_terms))
         if self._num_task_metrics > 0:
-            reset_info["task_metrics"] = jnp.zeros(self._num_task_metrics)
+            # (num_drones, num_task_metrics) — matches reward_terms' own
+            # per-agent axis just above; task_metrics is per-agent here
+            # (e.g. ma_race/loggers.py's lap_completed), unlike the
+            # single-agent aviary where it's a flat (num_names,) vector.
+            reset_info["task_metrics"] = jnp.zeros((self.num_drones, self._num_task_metrics))
         if self._num_episode_task_metrics > 0:
             reset_info["episode_task_metrics"] = jnp.zeros(self._num_episode_task_metrics)
         reset_info["terminations"] = jnp.zeros(
@@ -395,6 +518,13 @@ class MultiVectorAviary:
             done=jnp.bool_(False),
             info=reset_info,
             task_state=task_state,
+            phys_params=phys_params,
+            motor_rpm=jnp.broadcast_to(phys_params.hover_rpm[:, None], (self.num_drones, 4)),
+            # Rate-PID state resets to 0 every episode, independently per
+            # drone — see vectorized/__init__.py's MJXVectorAviary._single_reset
+            # for the full rationale (matches AgileFlight's own per-env reset).
+            pid_integral=jnp.zeros((self.num_drones, 3)),
+            pid_prev_omega=jnp.zeros((self.num_drones, 3)),
         )
 
     def _generate_xml(self, plugin) -> str:
