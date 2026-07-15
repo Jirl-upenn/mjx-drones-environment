@@ -78,6 +78,34 @@ def _check_deps():
 # Shared state container
 # ---------------------------------------------------------------------------
 
+class PhysParams(NamedTuple):
+    """Per-env drone dynamics/mixer coefficients — the hand-computed (not
+    MuJoCo-model-level) quantities _single_step uses to turn RPM into
+    force/torque. Deliberately excludes mass/inertia: those are real MJX
+    rigid-body model parameters baked into the compiled model at XML-build
+    time, not plain JAX values this module owns, so randomizing them would
+    need a batched mjx.Model (vmapped model *and* data), a separate, bigger
+    change. This mirrors the scope of the reference domain-randomization
+    setup this was modeled on actually randomizes (control/mixer-layer
+    coefficients only, no mass/inertia).
+
+    hover_rpm is carried alongside kf rather than recomputed from mass each
+    step since mass itself is never randomized here — see
+    domain_rand_fn's docstring below for the exact derivation.
+
+    differential_frac only affects mix_attitude_rpm's roll/pitch/yaw_rate
+    mixing gain — mix_rpm_action (the "rpm" action_type) commands each motor
+    independently and has no equivalent gain, so this field is simply unused
+    (not incorrect, just inert) when action_type="rpm".
+    """
+    kf: Any
+    km: Any
+    arm_length: Any
+    max_rpm: Any
+    hover_rpm: Any
+    differential_frac: Any
+
+
 class MJXState(NamedTuple):
     """State container for vectorized simulation.
 
@@ -90,6 +118,10 @@ class MJXState(NamedTuple):
     done: Any               # jnp.ndarray (num_envs,) bool
     info: Dict[str, Any]    # additional info
     task_state: Any         # HoverTaskState | RaceTaskState | custom
+    phys_params: Any        # PhysParams (batched over num_envs) — see domain_rand_fn
+    motor_rpm: Any          # (num_envs, 4) float32 — actual (lagged) per-motor RPM;
+                             # see motor_tau in __init__. Equals the commanded RPM
+                             # exactly, every substep, when motor_tau=0 (the default).
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +162,30 @@ class MJXVectorAviary:
         Custom JAX reset function ``(data, rng) -> data`` called inside vmap.
         When None a small position-noise reset is used for hover; the plugin
         should supply a reset_fn for tasks that need something different.
+    mass, kf, km, arm_length, max_rpm : float
+        Nominal drone dynamics constants. Default to the Crazyflie 2.x values
+        this module was built around; override to simulate a different
+        drone platform without editing this file.
+    domain_rand_fn : callable or None
+        ``(rng, nominal: PhysParams) -> PhysParams`` called once per env,
+        per episode reset (inside vmap, same as reset_fn but independent of
+        it — reset_fn decides where the drone spawns, domain_rand_fn decides
+        what its dynamics are this episode). ``nominal`` is built from the
+        mass/kf/km/arm_length/max_rpm above. None (default) disables
+        randomization — every env always uses the nominal PhysParams
+        unchanged. Task packages (e.g. race/dynamics.py) own the actual
+        ranges/distribution; this module only owns the mechanism (sampling
+        once per reset, threading the result through step()'s force/torque
+        computation, preserving it unchanged across steps within an episode).
+    motor_tau : float
+        First-order motor/rotor time constant (seconds); 0 (default) means
+        instant, zero-order-hold actuation — commanded RPM is realized as
+        force with no lag, matching this module's behavior before motor lag
+        existed. > 0 integrates the actual per-motor RPM toward the commanded
+        value at the *physics* rate (sim_freq), not the control rate, since a
+        real motor's spin-up/spin-down happens continuously between control
+        steps, not in one jump at the control boundary. Fixed at construction
+        (not per-env/randomized) — same value for every env.
 
     Example
     -------
@@ -155,6 +211,13 @@ class MJXVectorAviary:
         reset_fn=None,
         action_type: str = "rpm",
         bounding_box: Optional[Tuple[float, float, float]] = None,
+        mass: float = 0.027,
+        kf: float = 3.16e-10,
+        km: float = 7.94e-12,
+        arm_length: float = 0.0397,
+        max_rpm: float = 21714.0,
+        domain_rand_fn=None,
+        motor_tau: float = 0.0,
     ):
         _check_deps()
         if plugin is None:
@@ -175,15 +238,31 @@ class MJXVectorAviary:
         self._action_type = action_type
         self._custom_reset_fn = reset_fn
         self._bounding_box = bounding_box
+        self._domain_rand_fn = domain_rand_fn
+        self._motor_tau = motor_tau
+        # alpha=1.0 (motor_tau<=0) makes the lag update below an identity:
+        # actual RPM := commanded RPM every substep, exactly the old
+        # zero-order-hold behavior — one code path for both cases, no branch.
+        sim_dt = 1.0 / sim_freq
+        self._motor_alpha = 1.0 if motor_tau <= 0.0 else sim_dt / (motor_tau + sim_dt)
 
-        # Physical constants (Crazyflie 2.x)
-        self.mass = 0.027
+        # Physical constants — Crazyflie 2.x by default; pass mass/kf/km/
+        # arm_length/max_rpm to simulate a different drone platform.
+        self.mass = mass
         self.gravity = 9.81
-        self.kf = 3.16e-10
-        self.km = 7.94e-12
-        self.arm_length = 0.0397
-        self.max_rpm = 21714.0
+        self.kf = kf
+        self.km = km
+        self.arm_length = arm_length
+        self.max_rpm = max_rpm
         self.hover_rpm = np.sqrt((self.mass * self.gravity) / (4 * self.kf))
+        self.differential_frac = 0.02  # nominal mix_attitude_rpm gain — see PhysParams
+        # Nominal per-env dynamics — what every env uses when domain_rand_fn
+        # is None, and the baseline domain_rand_fn perturbs around otherwise.
+        self._nominal_phys = PhysParams(
+            kf=self.kf, km=self.km, arm_length=self.arm_length,
+            max_rpm=self.max_rpm, hover_rpm=self.hover_rpm,
+            differential_frac=self.differential_frac,
+        )
 
         # Gate xyz positions — needed only for XML marker generation.
         # Retrieved from the plugin so there's one source of truth.
@@ -280,6 +359,13 @@ class MJXVectorAviary:
             done=jnp.zeros(self.num_envs, dtype=jnp.bool_),
             info={},
             task_state=self._task.init_task_state(self.num_envs),
+            # Placeholders only — _reset_fn (_single_reset) below returns a
+            # complete new MJXState, including its own freshly-sampled
+            # phys_params/motor_rpm, so these values are never actually read.
+            phys_params=jax.tree_util.tree_map(
+                lambda x: jnp.broadcast_to(x, (self.num_envs,)), self._nominal_phys
+            ),
+            motor_rpm=jnp.broadcast_to(self.hover_rpm, (self.num_envs, 4)),
         )
         state = self._reset_fn(state, rngs)
         obs = vmap(self._task.get_obs)(state.mjx_data, state.task_state)
@@ -339,34 +425,50 @@ class MJXVectorAviary:
 
     def _single_step(self, state: MJXState, action: Any) -> Tuple[MJXState, Any, Any, Any]:
         """Step a single environment (vmapped over batch)."""
+        phys = state.phys_params
         if self._action_type == "attitude":
-            rpm = mix_attitude_rpm(jnp, action, self.hover_rpm, self.max_rpm)
+            rpm_cmd = mix_attitude_rpm(
+                jnp, action, phys.hover_rpm, phys.max_rpm,
+                differential_frac=phys.differential_frac,
+            )
         else:  # "rpm"
-            rpm = mix_rpm_action(jnp, action, self.hover_rpm, self.max_rpm)
-
-        # Compute forces from RPM
-        forces = self.kf * rpm ** 2
-        total_thrust = jnp.sum(forces)
+            rpm_cmd = mix_rpm_action(jnp, action, phys.hover_rpm, phys.max_rpm)
 
         data = state.mjx_data
-        xmat = data.xmat[_BODY_ID].reshape(3, 3)
-        thrust_world = xmat @ jnp.array([0.0, 0.0, total_thrust])
+        alpha = self._motor_alpha  # 1.0 (no lag) unless motor_tau > 0 — see __init__
 
-        L, s2 = self.arm_length, jnp.sqrt(2.0)
-        tau_x = (forces[0] + forces[1] - forces[2] - forces[3]) * L / s2
-        tau_y = (-forces[0] + forces[1] + forces[2] - forces[3]) * L / s2
-        tau_z = (-forces[0] + forces[1] - forces[2] + forces[3]) * self.km / self.kf
-        torque_world = xmat @ jnp.array([tau_x, tau_y, tau_z])
+        def _physics_step(carry, _):
+            d, motor_rpm = carry
+            # First-order motor lag, integrated at the physics rate (not the
+            # control rate): a real motor's RPM moves continuously toward
+            # whatever was just commanded, it doesn't jump there instantly at
+            # the control boundary. alpha=1.0 makes this an identity
+            # (motor_rpm := rpm_cmd every substep), exactly the old
+            # zero-order-hold behavior — same formula, no branch needed.
+            motor_rpm = alpha * rpm_cmd + (1.0 - alpha) * motor_rpm
 
-        xfrc = jnp.zeros_like(data.xfrc_applied)
-        xfrc = xfrc.at[_BODY_ID, :3].set(thrust_world)
-        xfrc = xfrc.at[_BODY_ID, 3:].set(torque_world)
-        data = data.replace(xfrc_applied=xfrc)
+            forces = phys.kf * motor_rpm ** 2
+            total_thrust = jnp.sum(forces)
+            xmat = d.xmat[_BODY_ID].reshape(3, 3)
+            thrust_world = xmat @ jnp.array([0.0, 0.0, total_thrust])
 
-        def _physics_step(d, _):
-            return mjx.step(self._mjx_model, d), None
+            L, s2 = phys.arm_length, jnp.sqrt(2.0)
+            tau_x = (forces[0] + forces[1] - forces[2] - forces[3]) * L / s2
+            tau_y = (-forces[0] + forces[1] + forces[2] - forces[3]) * L / s2
+            tau_z = (-forces[0] + forces[1] - forces[2] + forces[3]) * phys.km / phys.kf
+            torque_world = xmat @ jnp.array([tau_x, tau_y, tau_z])
 
-        data, _ = lax.scan(_physics_step, data, None, length=self.sim_steps_per_ctrl)
+            xfrc = jnp.zeros_like(d.xfrc_applied)
+            xfrc = xfrc.at[_BODY_ID, :3].set(thrust_world)
+            xfrc = xfrc.at[_BODY_ID, 3:].set(torque_world)
+            d = d.replace(xfrc_applied=xfrc)
+
+            d = mjx.step(self._mjx_model, d)
+            return (d, motor_rpm), None
+
+        (data, motor_rpm), _ = lax.scan(
+            _physics_step, (data, state.motor_rpm), None, length=self.sim_steps_per_ctrl
+        )
 
         step_count = state.step_count + 1
         new_task_state, obs, reward, extra_done = self._task.step(data, action, state.task_state)
@@ -412,6 +514,13 @@ class MJXVectorAviary:
             done=done,
             info=step_info,
             task_state=new_task_state,
+            # Dynamics are fixed for the episode's duration — only resampled
+            # at reset (_single_reset), never mid-episode.
+            phys_params=phys,
+            # The lagged motor state carries forward continuously; unlike
+            # phys_params it evolves every step (that's the whole point of
+            # modeling lag), so it's *not* reset to a fixed value here.
+            motor_rpm=motor_rpm,
         )
         return new_state, obs, reward, done
 
@@ -420,7 +529,13 @@ class MJXVectorAviary:
         data = mjx.put_data(self._mj_model, mujoco.MjData(self._mj_model))
         reset_hint = None
         if self._custom_reset_fn is not None:
-            result = self._custom_reset_fn(data, rng, state.task_state)
+            # Split off reset_fn's own key rather than handing it the same
+            # `rng` that task_rng/phys_rng are later split from below — the
+            # reset_fn consumes rng internally (e.g. via its own further
+            # splits), so reusing the same value for a second, independent
+            # split afterward would correlate them instead of decorrelating.
+            rng, reset_fn_rng = jax.random.split(rng)
+            result = self._custom_reset_fn(data, reset_fn_rng, state.task_state)
             if isinstance(result, tuple):
                 data, reset_hint = result
             else:
@@ -442,6 +557,18 @@ class MJXVectorAviary:
         rng, task_rng = jax.random.split(rng)
         task_state = self._task.reset_task_state(data, task_rng, reset_hint, state.task_state)
 
+        # Domain randomization — independent of reset_fn (which decides where
+        # the drone spawns): resampled fresh every episode reset, never
+        # mid-episode (see _single_step, which just carries phys_params
+        # through unchanged). None (default) keeps every env on the nominal,
+        # un-randomized dynamics.
+        rng, phys_rng = jax.random.split(rng)
+        phys_params = (
+            self._domain_rand_fn(phys_rng, self._nominal_phys)
+            if self._domain_rand_fn is not None
+            else self._nominal_phys
+        )
+
         reset_info = {}
         if self._num_terms > 0:
             reset_info["reward_terms"] = jnp.zeros(self._num_terms)
@@ -456,6 +583,15 @@ class MJXVectorAviary:
             done=jnp.bool_(False),
             info=reset_info,
             task_state=task_state,
+            phys_params=phys_params,
+            # Start the lagged motor state at this env's (possibly
+            # randomized) hover point rather than 0 — "motors already
+            # spinning, holding position" is a realistic starting condition;
+            # starting from 0 would force every episode through an
+            # artificial spin-up ramp before the drone can even support its
+            # own weight, which motor_tau > 0 would otherwise make look like
+            # a near-guaranteed crash in the first few steps.
+            motor_rpm=jnp.full((4,), phys_params.hover_rpm),
         )
 
     def _generate_xml(self, plugin) -> str:
