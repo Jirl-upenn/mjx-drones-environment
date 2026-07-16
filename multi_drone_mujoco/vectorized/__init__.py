@@ -34,10 +34,7 @@ from typing import Any, Dict, NamedTuple, Optional, Tuple
 import numpy as np
 
 from .plugins import TaskPlugin
-from multi_drone_mujoco.utils.mixer import (
-    mix_attitude_rpm, mix_rpm_action, mix_attitude_pid_rpm,
-    KP_OMEGA_RP, KI_OMEGA_RP, KD_OMEGA_RP, KP_OMEGA_Y, KI_OMEGA_Y, KD_OMEGA_Y,
-)
+from multi_drone_mujoco.utils.mixer import mix_attitude_rpm, mix_rpm_action
 
 # Lazy imports for JAX/MJX (only required at runtime)
 _JAX_AVAILABLE = False
@@ -110,15 +107,6 @@ class PhysParams(NamedTuple):
     this field every step, which already reduces to alpha=1.0 (no lag, the
     old zero-order-hold behavior) exactly when motor_tau=0 — no separate
     branch needed.
-
-    kp_omega_rp/ki_omega_rp/kd_omega_rp/kp_omega_y/ki_omega_y/kd_omega_y are
-    attitude_pid's inner rate-PID gains (see
-    multi_drone_mujoco.utils.mixer.rate_pid_moment) — same "unused, not
-    incorrect" precedent as differential_frac when action_type isn't
-    "attitude_pid". Mirrors AgileFlight_MultiAgent's own
-    _init_randomization_ranges, which randomizes exactly these six gains
-    (and none of: the anti-windup i_limits, or the body-rate scales) — see
-    envspecs/dynamics.py's *_range fields.
     """
     kf: Any
     km: Any
@@ -127,12 +115,6 @@ class PhysParams(NamedTuple):
     hover_rpm: Any
     differential_frac: Any
     motor_tau: Any
-    kp_omega_rp: Any
-    ki_omega_rp: Any
-    kd_omega_rp: Any
-    kp_omega_y: Any
-    ki_omega_y: Any
-    kd_omega_y: Any
 
 
 class MJXState(NamedTuple):
@@ -151,15 +133,6 @@ class MJXState(NamedTuple):
     motor_rpm: Any          # (num_envs, 4) float32 — actual (lagged) per-motor RPM;
                              # see motor_tau in __init__. Equals the commanded RPM
                              # exactly, every substep, when motor_tau=0 (the default).
-    pid_integral: Any       # (num_envs, 3) float32 — attitude_pid's rate-PID integral
-                             # term (body frame). Always present but inert (stays at
-                             # its reset value of 0, never read) unless
-                             # action_type="attitude_pid" — same "unused, not
-                             # incorrect" precedent as PhysParams.differential_frac.
-    pid_prev_omega: Any     # (num_envs, 3) float32 — attitude_pid's previous measured
-                             # body-frame angular velocity, for derivative-on-
-                             # measurement. Same inert-unless-attitude_pid convention
-                             # as pid_integral above.
 
 
 # ---------------------------------------------------------------------------
@@ -171,10 +144,7 @@ _BODY_ID = 1  # drone body index in the MJX model
 # Diagonal body inertia (kg*m^2) baked into every drone's <inertial> tag in
 # _generate_xml below — a real MJX rigid-body model constant, not a plain
 # JAX value PhysParams can carry (see PhysParams' own docstring on why
-# mass/inertia are excluded from domain randomization here). Shared as a
-# module-level constant rather than duplicated so attitude_pid's rate-PID
-# (which needs inertia @ angular_acceleration = commanded moment) and
-# _generate_xml's diaginertia string always agree.
+# mass/inertia are excluded from domain randomization here).
 _INERTIA_DIAG = (1.4e-5, 1.4e-5, 2.17e-5)
 
 class MJXVectorAviary:
@@ -213,18 +183,10 @@ class MJXVectorAviary:
         Nominal drone dynamics constants. Default to the Crazyflie 2.x values
         this module was built around; override to simulate a different
         drone platform without editing this file.
-    action_type : {"rpm", "attitude", "attitude_pid"}
+    action_type : {"rpm", "attitude"}
         "rpm": direct per-motor command (mix_rpm_action). "attitude": fixed-gain
         thrust + roll/pitch/yaw_rate differential mixer with no feedback
-        (mix_attitude_rpm). "attitude_pid": a genuine closed-loop CTBR
-        controller replicating ~/AgileFlight_MultiAgent's action interface
-        (ma_quadcopter_env.py's _get_moment_from_ctbr) — same [thrust_norm,
-        roll_rate, pitch_rate, yaw_rate] action slots, but roll/pitch/yaw_rate
-        are body-rate setpoints tracked by an inner rate PID (running once per
-        physics substep, matching AgileFlight's PID-at-physics-rate design)
-        rather than open-loop RPM differentials. See
-        multi_drone_mujoco/utils/mixer.py's mix_attitude_pid_rpm for the full
-        pipeline and exact gain values.
+        (mix_attitude_rpm).
     domain_rand_fn : callable or None
         ``(rng, nominal: PhysParams) -> PhysParams`` called once per env,
         per episode reset (inside vmap, same as reset_fn but independent of
@@ -296,9 +258,9 @@ class MJXVectorAviary:
         self.ctrl_freq = ctrl_freq
         self.sim_steps_per_ctrl = sim_freq // ctrl_freq
 
-        if action_type not in ("rpm", "attitude", "attitude_pid"):
+        if action_type not in ("rpm", "attitude"):
             raise ValueError(
-                f"action_type must be 'rpm', 'attitude', or 'attitude_pid', got {action_type!r}"
+                f"action_type must be 'rpm' or 'attitude', got {action_type!r}"
             )
         self._action_type = action_type
         self._custom_reset_fn = reset_fn
@@ -316,8 +278,6 @@ class MJXVectorAviary:
         self.max_rpm = max_rpm
         self.hover_rpm = np.sqrt((self.mass * self.gravity) / (4 * self.kf))
         self.differential_frac = 0.02  # nominal mix_attitude_rpm gain — see PhysParams
-        # attitude_pid's rate-PID needs inertia @ angular_acceleration =
-        # commanded moment — see _INERTIA_DIAG's docstring above.
         self._inertia_diag = jnp.array(_INERTIA_DIAG)
         # Nominal per-env dynamics — what every env uses when domain_rand_fn
         # is None, and the baseline domain_rand_fn perturbs around otherwise.
@@ -326,9 +286,6 @@ class MJXVectorAviary:
             max_rpm=self.max_rpm, hover_rpm=self.hover_rpm,
             differential_frac=self.differential_frac,
             motor_tau=self._motor_tau,
-            # attitude_pid rate-PID gains — see PhysParams docstring.
-            kp_omega_rp=KP_OMEGA_RP, ki_omega_rp=KI_OMEGA_RP, kd_omega_rp=KD_OMEGA_RP,
-            kp_omega_y=KP_OMEGA_Y, ki_omega_y=KI_OMEGA_Y, kd_omega_y=KD_OMEGA_Y,
         )
 
         # Gate xyz positions — needed only for XML marker generation.
@@ -433,8 +390,6 @@ class MJXVectorAviary:
                 lambda x: jnp.broadcast_to(x, (self.num_envs,)), self._nominal_phys
             ),
             motor_rpm=jnp.broadcast_to(self.hover_rpm, (self.num_envs, 4)),
-            pid_integral=jnp.zeros((self.num_envs, 3)),
-            pid_prev_omega=jnp.zeros((self.num_envs, 3)),
         )
         state = self._reset_fn(state, rngs)
         obs = vmap(self._task.get_obs)(state.mjx_data, state.task_state)
@@ -495,12 +450,7 @@ class MJXVectorAviary:
     def _single_step(self, state: MJXState, action: Any) -> Tuple[MJXState, Any, Any, Any]:
         """Step a single environment (vmapped over batch)."""
         phys = state.phys_params
-        if self._action_type == "attitude_pid":
-            # Computed fresh every physics substep inside _physics_step below
-            # (needs the current measured angular velocity) rather than once
-            # here — see mix_attitude_pid_rpm's docstring.
-            rpm_cmd = None
-        elif self._action_type == "attitude":
+        if self._action_type == "attitude":
             rpm_cmd = mix_attitude_rpm(
                 jnp, action, phys.hover_rpm, phys.max_rpm,
                 differential_frac=phys.differential_frac,
@@ -517,28 +467,9 @@ class MJXVectorAviary:
         alpha = sim_dt / (phys.motor_tau + sim_dt)
 
         def _physics_step(carry, _):
-            d, motor_rpm, pid_integral, prev_omega = carry
+            d, motor_rpm = carry
             xmat = d.xmat[_BODY_ID].reshape(3, 3)
-
-            if self._action_type == "attitude_pid":
-                # Measured body-frame angular velocity: MJX's freejoint qvel
-                # angular component is expressed in the WORLD frame (like
-                # AgileFlight's own root_ang_vel_b, but that one is already
-                # body-frame) — rotate it into the body frame with xmat^T,
-                # the same rotation convention _single_step already uses the
-                # other way (xmat @ v_body -> v_world) just below.
-                omega_world = d.qvel[3:6]
-                omega_body = xmat.T @ omega_world
-                step_rpm_cmd, pid_integral, prev_omega = mix_attitude_pid_rpm(
-                    jnp, action, omega_body, pid_integral, prev_omega,
-                    self.mass, self.gravity, phys.kf, phys.km, phys.arm_length,
-                    phys.max_rpm, self._inertia_diag, sim_dt,
-                    kp_omega_rp=phys.kp_omega_rp, ki_omega_rp=phys.ki_omega_rp,
-                    kd_omega_rp=phys.kd_omega_rp, kp_omega_y=phys.kp_omega_y,
-                    ki_omega_y=phys.ki_omega_y, kd_omega_y=phys.kd_omega_y,
-                )
-            else:
-                step_rpm_cmd = rpm_cmd
+            step_rpm_cmd = rpm_cmd
 
             # First-order motor lag, integrated at the physics rate (not the
             # control rate): a real motor's RPM moves continuously toward
@@ -564,11 +495,11 @@ class MJXVectorAviary:
             d = d.replace(xfrc_applied=xfrc)
 
             d = mjx.step(self._mjx_model, d)
-            return (d, motor_rpm, pid_integral, prev_omega), None
+            return (d, motor_rpm), None
 
-        (data, motor_rpm, pid_integral, prev_omega), _ = lax.scan(
+        (data, motor_rpm), _ = lax.scan(
             _physics_step,
-            (data, state.motor_rpm, state.pid_integral, state.pid_prev_omega),
+            (data, state.motor_rpm),
             None, length=self.sim_steps_per_ctrl,
         )
 
@@ -623,11 +554,6 @@ class MJXVectorAviary:
             # phys_params it evolves every step (that's the whole point of
             # modeling lag), so it's *not* reset to a fixed value here.
             motor_rpm=motor_rpm,
-            # Same continuity rationale as motor_rpm — unchanged pass-through
-            # when action_type != "attitude_pid" (the scan never touches them
-            # in that branch, see _physics_step above).
-            pid_integral=pid_integral,
-            pid_prev_omega=prev_omega,
         )
         return new_state, obs, reward, done
 
@@ -699,13 +625,6 @@ class MJXVectorAviary:
             # own weight, which motor_tau > 0 would otherwise make look like
             # a near-guaranteed crash in the first few steps.
             motor_rpm=jnp.full((4,), phys_params.hover_rpm),
-            # Rate-PID state resets to 0 every episode (matches AgileFlight's
-            # own env reset: _omega_err_integral/_previous_omega_meas zeroed
-            # per env_id) — rate_pid_moment's epsilon guard treats a 0
-            # prev_omega_meas as "just reset" and zeroes the derivative term
-            # on the first substep accordingly.
-            pid_integral=jnp.zeros(3),
-            pid_prev_omega=jnp.zeros(3),
         )
 
     def _generate_xml(self, plugin) -> str:
