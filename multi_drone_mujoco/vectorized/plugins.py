@@ -43,8 +43,20 @@ class TaskPlugin(ABC):
         data: Any,
         action: Any,
         task_state: Any,
+        motor_rpm: Any = None,
+        phys_params: Any = None,
     ) -> Tuple[Any, Any, Any, Any]:
         """Compute one control step for a single env (called inside vmap).
+
+        motor_rpm : the aviary's own actuator state (post-physics-substep,
+            (4,) per motor) — None from callers that don't have it (e.g.
+            MultiVectorAviary, which doesn't currently thread this through).
+            Plugins that don't need it simply ignore the argument.
+        phys_params : this env's PhysParams for the episode (kf, km,
+            arm_length, max_rpm, hover_rpm, differential_frac, motor_tau) —
+            None from callers that don't have it. Ground truth for whatever
+            domain_rand_fn sampled this episode; plugins that don't need it
+            simply ignore the argument.
 
         Returns
         -------
@@ -55,8 +67,14 @@ class TaskPlugin(ABC):
         """
 
     @abstractmethod
-    def get_obs(self, data: Any, task_state: Any) -> Any:
-        """Extract observation for a single env (called inside vmap)."""
+    def get_obs(
+        self, data: Any, task_state: Any, motor_rpm: Any = None, phys_params: Any = None
+    ) -> Any:
+        """Extract observation for a single env (called inside vmap).
+
+        motor_rpm, phys_params : see step()'s docstring — optional, ignored
+            by plugins that don't need them.
+        """
 
     termination_names: list = []
 

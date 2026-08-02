@@ -129,7 +129,7 @@ class MultiVectorAviary:
         arm_length: float = 0.0397,
         max_rpm: float = 21714.0,
         domain_rand_fn=None,
-        motor_tau: float = 0.0,
+        motor_tau: float = 0.15,
     ):
         _check_deps()
         if plugin is None:

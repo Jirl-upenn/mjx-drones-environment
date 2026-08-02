@@ -248,37 +248,6 @@ def demo_obstacles():
     save_gif(frames, "/root/multi_drone_mujoco/demo_gifs/obstacles.gif")
 
 
-def demo_domain_randomization():
-    print("Rendering: Domain Randomization...")
-    from multi_drone_mujoco.wrappers import DomainRandomizationWrapper, DomainRandomizationConfig
-    base_env = make_env(initial_xyzs=np.array([[0.0, 0.0, 0.5]]))
-    dr_cfg = DomainRandomizationConfig(
-        mass_range=(0.6, 1.4), inertia_range=(0.6, 1.4),
-        kf_range=(0.7, 1.3), km_range=(0.7, 1.3),
-        action_delay_steps=2, motor_time_constant=0.015)
-    env = DomainRandomizationWrapper(base_env, dr_cfg)
-    ctrl = PIDControl(base_env)
-    target = np.array([0.0, 0.0, 1.0])
-
-    all_frames = []
-    for ep in range(3):
-        env.reset(seed=ep * 7)
-        for _ in range(400):
-            rpm, _, _ = ctrl.computeControl(
-                base_env.CTRL_TIMESTEP, base_env.pos[0], base_env.quat[0],
-                base_env.vel[0], base_env.ang_v[0], target)
-            env.step(rpm.flatten())
-        for i in range(120):
-            rpm, _, _ = ctrl.computeControl(
-                base_env.CTRL_TIMESTEP, base_env.pos[0], base_env.quat[0],
-                base_env.vel[0], base_env.ang_v[0], target)
-            env.step(rpm.flatten())
-            if i % 3 == 0:
-                all_frames.append(base_env.render(camera_mode="track"))
-    env.close()
-    save_gif(all_frames, "/root/multi_drone_mujoco/demo_gifs/domain_randomization.gif")
-
-
 def demo_vertical_circle():
     print("Rendering: Vertical circular track...")
     env = make_env(initial_xyzs=np.array([[0.0, 0.0, 0.5]]))
@@ -315,7 +284,7 @@ if __name__ == "__main__":
     print("=" * 50)
     demos = [demo_hover_track, demo_hover_fixed, demo_hover_fpv,
              demo_multi_drone, demo_formation, demo_wind,
-             demo_obstacles, demo_domain_randomization, demo_vertical_circle]
+             demo_obstacles, demo_vertical_circle]
     for demo in demos:
         try:
             demo()

@@ -199,18 +199,20 @@ class MJXVectorAviary:
         once per reset, threading the result through step()'s force/torque
         computation, preserving it unchanged across steps within an episode).
     motor_tau : float
-        Nominal first-order motor/rotor time constant (seconds); 0 (default)
-        means instant, zero-order-hold actuation — commanded RPM is realized
-        as force with no lag, matching this module's behavior before motor
-        lag existed. > 0 integrates the actual per-motor RPM toward the
-        commanded value at the *physics* rate (sim_freq), not the control
+        Nominal first-order motor/rotor time constant (seconds); 0.15
+        (default) matches the real Crazyflie figure reported in "Learning to
+        Fly in Seconds" — commanded RPM is integrated toward the actual
+        per-motor RPM at the *physics* rate (sim_freq), not the control
         rate, since a real motor's spin-up/spin-down happens continuously
-        between control steps, not in one jump at the control boundary. Part
-        of PhysParams (like kf/km/etc.) — every env uses this fixed value
-        unless domain_rand_fn overrides it per-env (see race/dynamics.py's
+        between control steps, not in one jump at the control boundary. Pass
+        0.0 explicitly for instant, zero-order-hold actuation (no lag —
+        this module's behavior before motor lag existed). Part of PhysParams
+        (like kf/km/etc.) — every env uses this fixed value unless
+        domain_rand_fn overrides it per-env (see race/dynamics.py's
         motor_tau_range: an *absolute*, not multiplicative-around-nominal,
-        range — 0 is motor_tau's natural "disabled" value, and multiplying
-        0 by anything is still 0).
+        range — 0 is motor_tau's degenerate-but-valid "disabled" value, and
+        multiplying 0 by anything is still 0, which is why it's absolute
+        rather than scaled around this nominal).
 
     Example
     -------
@@ -242,7 +244,7 @@ class MJXVectorAviary:
         arm_length: float = 0.0397,
         max_rpm: float = 21714.0,
         domain_rand_fn=None,
-        motor_tau: float = 0.0,
+        motor_tau: float = 0.15,
     ):
         _check_deps()
         if plugin is None:
@@ -305,6 +307,11 @@ class MJXVectorAviary:
         self._task: TaskPlugin = plugin
         self.obs_dim = self._task.obs_dim
         self.act_dim = 4 * num_drones
+        # Critic-only privileged features (asymmetric actor-critic) — 0-width
+        # (empty) unless the plugin defines get_privileged_obs/privileged_dim
+        # (see race/plugin.py + envspecs.observations.ObservationFunction.privileged).
+        # Mirrors MultiVectorAviary's identical field.
+        self.privileged_dim = getattr(plugin, "privileged_dim", 0)
 
         # Reward term decomposition (optional — enabled when reward fn exposes compute_terms)
         _reward_fn = getattr(plugin, '_reward_fn', None)
@@ -392,7 +399,9 @@ class MJXVectorAviary:
             motor_rpm=jnp.broadcast_to(self.hover_rpm, (self.num_envs, 4)),
         )
         state = self._reset_fn(state, rngs)
-        obs = vmap(self._task.get_obs)(state.mjx_data, state.task_state)
+        obs = vmap(self._task.get_obs)(
+            state.mjx_data, state.task_state, motor_rpm=state.motor_rpm, phys_params=state.phys_params
+        )
         return obs, state
 
     def step(self, keys: Any, state: MJXState, action: Any, params=None) -> Tuple[Any, MJXState, Any, Any, Dict]:
@@ -420,6 +429,14 @@ class MJXVectorAviary:
         # gets overwritten with further down for done envs. Always present,
         # identical to `obs` itself for envs that didn't reset this step.
         info["true_final_obs"] = obs
+        # Same rationale, for an asymmetric/centralized critic's own input
+        # (own obs ++ privileged features) — computed from next_state (the
+        # true, pre-reset state) rather than the post-reset final_state
+        # get_critic_obs() would otherwise be called on. 0-width privileged
+        # features (the default) make this identical to true_final_obs.
+        info["true_final_critic_obs"] = jnp.concatenate(
+            [obs, self.get_critic_obs(next_state)], axis=-1
+        )
 
         if self._death_cost != 0.0:
             terminations = info["terminations"]
@@ -430,7 +447,10 @@ class MJXVectorAviary:
             reward = jnp.where(is_crash, reward + self._death_cost, reward)
 
         reset_state = self._reset_fn(next_state, keys)
-        reset_obs = vmap(self._task.get_obs)(reset_state.mjx_data, reset_state.task_state)
+        reset_obs = vmap(self._task.get_obs)(
+            reset_state.mjx_data, reset_state.task_state,
+            motor_rpm=reset_state.motor_rpm, phys_params=reset_state.phys_params,
+        )
 
         def _select(r, n):
             if not hasattr(r, "ndim") or r.ndim == 0:
@@ -445,7 +465,22 @@ class MJXVectorAviary:
 
     def get_obs(self, state: MJXState) -> Any:
         """Extract observations from a batched state."""
-        return vmap(self._task.get_obs)(state.mjx_data, state.task_state)
+        return vmap(self._task.get_obs)(
+            state.mjx_data, state.task_state, motor_rpm=state.motor_rpm, phys_params=state.phys_params
+        )
+
+    def get_critic_obs(self, state: MJXState) -> Any:
+        """Critic-only privileged features, shape (num_envs, privileged_dim) —
+        0-width (empty) unless the plugin's obs_fn defines some (see
+        envspecs.observations.ObservationFunction.privileged). Callers
+        wanting an asymmetric/centralized critic concatenate this with
+        get_obs()'s regular actor observation themselves; mirrors
+        MultiVectorAviary's identical method."""
+        if not hasattr(self._task, "get_privileged_obs"):
+            return jnp.zeros((state.step_count.shape[0], 0))
+        return vmap(self._task.get_privileged_obs)(
+            state.mjx_data, state.task_state, motor_rpm=state.motor_rpm, phys_params=state.phys_params
+        )
 
     def _single_step(self, state: MJXState, action: Any) -> Tuple[MJXState, Any, Any, Any]:
         """Step a single environment (vmapped over batch)."""
@@ -504,7 +539,9 @@ class MJXVectorAviary:
         )
 
         step_count = state.step_count + 1
-        new_task_state, obs, reward, extra_done = self._task.step(data, action, state.task_state)
+        new_task_state, obs, reward, extra_done = self._task.step(
+            data, action, state.task_state, motor_rpm=motor_rpm, phys_params=phys
+        )
         timeout = step_count >= self.episode_length
 
         # Named termination checks — plugin-defined, resolved at trace time.

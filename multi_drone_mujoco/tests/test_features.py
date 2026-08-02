@@ -1,4 +1,9 @@
-"""Tests for new features: domain randomization, wind, obstacles, curriculum."""
+"""Tests for CPU-side features: wind, obstacles.
+
+Domain randomization and curriculum tests used to live here too but were
+removed along with DomainRandomizationWrapper/CurriculumWrapper — that
+logic is now handled GPU-side in mjc_dronetests (see
+multi_drone_mujoco/wrappers/__init__.py's module docstring)."""
 
 import numpy as np
 import pytest
@@ -12,54 +17,15 @@ from multi_drone_mujoco.utils.enums import Physics
 def HoverAviary(**kwargs):
     kwargs.setdefault("episode_len_sec", 10.0)
     return TaskAviary(plugin=SimpleHoverPlugin(), **kwargs)
-from multi_drone_mujoco.wrappers import DomainRandomizationWrapper, DomainRandomizationConfig
 from multi_drone_mujoco.wrappers.wind import WindField, WindConfig, WindModel
 from multi_drone_mujoco.wrappers.obstacles import (
     generate_obstacles, obstacles_to_xml, ObstacleConfig, ObstacleType
 )
-from multi_drone_mujoco.wrappers.curriculum import CurriculumWrapper, CurriculumConfig
 
 try:
     from multi_drone_mujoco.vectorized import _MJX_AVAILABLE
 except ImportError:
     _MJX_AVAILABLE = False
-
-
-class TestDomainRandomization:
-    def test_wraps_env(self):
-        env = HoverAviary()
-        config = DomainRandomizationConfig(mass_range=(0.5, 1.5))
-        wrapped = DomainRandomizationWrapper(env, config)
-        obs, info = wrapped.reset(seed=42)
-        assert obs.shape == (12,)
-        assert "domain_params" in info
-        wrapped.close()
-
-    def test_mass_randomized(self):
-        env = HoverAviary()
-        config = DomainRandomizationConfig(mass_range=(2.0, 2.0))  # Always 2x
-        wrapped = DomainRandomizationWrapper(env, config)
-        wrapped.reset(seed=0)
-        assert abs(env.M - 0.027 * 2.0) < 1e-6
-        wrapped.close()
-
-    def test_action_delay(self):
-        env = HoverAviary()
-        config = DomainRandomizationConfig(action_delay_range=(2, 2))
-        wrapped = DomainRandomizationWrapper(env, config)
-        wrapped.reset(seed=0)
-        # First steps should get zero action due to delay
-        obs, _, _, _, _ = wrapped.step(np.ones(4))
-        assert wrapped._current_delay == 2
-        wrapped.close()
-
-    def test_motor_lag(self):
-        env = HoverAviary()
-        config = DomainRandomizationConfig(motor_time_constant_range=(0.01, 0.01))
-        wrapped = DomainRandomizationWrapper(env, config)
-        wrapped.reset(seed=0)
-        wrapped.step(np.ones(4))  # Should not crash
-        wrapped.close()
 
 
 class TestWindModel:
@@ -169,58 +135,6 @@ class TestObstacles:
         for obs in obstacles:
             dist = np.linalg.norm(obs.position[:2])
             assert dist >= 1.0
-
-
-class TestCurriculum:
-    def test_basic_curriculum(self):
-        env = HoverAviary()
-        config = CurriculumConfig(
-            num_levels=5,
-            window_size=3,
-            threshold_advance=0.5,
-            start_level=0,
-        )
-
-        def difficulty_fn(e, level):
-            e.TARGET_HEIGHT = 0.5 + level * 0.2
-
-        wrapped = CurriculumWrapper(env, difficulty_fn, config)
-        obs, info = wrapped.reset()
-        assert info["curriculum_level"] == 0
-        assert wrapped.env.TARGET_HEIGHT == 0.5
-        wrapped.close()
-
-    def test_level_advances(self):
-        env = HoverAviary()
-        config = CurriculumConfig(
-            num_levels=5,
-            window_size=2,
-            threshold_advance=0.5,
-            metric="reward",
-            advance_count=1,
-        )
-
-        def difficulty_fn(e, level):
-            pass
-
-        wrapped = CurriculumWrapper(env, difficulty_fn, config)
-        wrapped.reset()
-
-        # Simulate episodes with high reward to trigger advance
-        # Manually inject metrics
-        wrapped._episode_metrics.extend([100.0, 100.0])
-        wrapped._maybe_adjust_level()
-        assert wrapped.current_level == 1
-        wrapped.close()
-
-    def test_stats(self):
-        env = HoverAviary()
-        wrapped = CurriculumWrapper(env, lambda e, l: None)
-        wrapped.reset()
-        stats = wrapped.get_stats()
-        assert "level" in stats
-        assert "progress" in stats
-        wrapped.close()
 
 
 class TestMJXVectorized:

@@ -30,7 +30,7 @@ class SimpleHoverPlugin(CPUTaskPlugin):
 
     def reset(self, env, seed=None, options=None) -> None:
         # Seed once; don't clobber external mutation of env.TARGET_HEIGHT
-        # between resets (e.g. a CurriculumWrapper adjusting difficulty).
+        # between resets (e.g. a wrapper adjusting difficulty externally).
         if not hasattr(env, "TARGET_HEIGHT"):
             env.TARGET_HEIGHT = self.target_height
 
