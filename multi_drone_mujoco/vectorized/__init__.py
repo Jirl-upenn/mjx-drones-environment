@@ -35,6 +35,7 @@ import numpy as np
 
 from .plugins import TaskPlugin
 from multi_drone_mujoco.utils.mixer import mix_attitude_rpm, mix_rpm_action
+from multi_drone_mujoco.utils import motor_physics as _motor
 
 # Lazy imports for JAX/MJX (only required at runtime)
 _JAX_AVAILABLE = False
@@ -81,17 +82,26 @@ def _check_deps():
 class PhysParams(NamedTuple):
     """Per-env drone dynamics/mixer coefficients — the hand-computed (not
     MuJoCo-model-level) quantities _single_step uses to turn RPM into
-    force/torque. Deliberately excludes mass/inertia: those are real MJX
-    rigid-body model parameters baked into the compiled model at XML-build
-    time, not plain JAX values this module owns, so randomizing them would
-    need a batched mjx.Model (vmapped model *and* data), a separate, bigger
-    change. This mirrors the scope of the reference domain-randomization
-    setup this was modeled on actually randomizes (control/mixer-layer
-    coefficients only, no mass/inertia).
+    force/torque, via utils/motor_physics.py's motor_physics_step. Excludes
+    mass/inertia: those live on ModelParams/MJXState.model_params instead,
+    since they're real MJX rigid-body model fields (see ModelParams' own
+    docstring for why that needs different plumbing than this NamedTuple).
 
-    hover_rpm is carried alongside kf rather than recomputed from mass each
-    step since mass itself is never randomized here — see
-    domain_rand_fn's docstring below for the exact derivation.
+    kf/km are DIMENSIONLESS multipliers (nominal 1.0 each) on
+    motor_physics.py's fitted cubic thrust/torque curves — not raw
+    coefficients of a quadratic law like this module used before. This
+    keeps kf_range/km_range/twr_range-style "multiplicative scale around
+    nominal" domain-randomization configs valid unchanged in *shape*; only
+    what "1.0x" means changed. km is no longer defined as a ratio to kf
+    (the old quadratic-law code did tau_z ∝ km/kf) — thrust and torque are
+    now independent curves, each with its own multiplier.
+
+    hover_rpm is still carried here (not derived fresh by every caller) but
+    is now recomputed by _single_reset itself, from whatever kf/mass this
+    episode actually landed on — see _single_reset's docstring — rather
+    than trusted from domain_rand_fn's own return value, since
+    domain_rand_fn's (rng, nominal: PhysParams) -> PhysParams contract can't
+    see model_params.body_mass at all.
 
     differential_frac only affects mix_attitude_rpm's roll/pitch/yaw_rate
     mixing gain — mix_rpm_action (the "rpm" action_type) commands each motor
@@ -99,14 +109,20 @@ class PhysParams(NamedTuple):
     (not incorrect, just inert) when action_type="rpm".
 
     motor_tau (first-order motor lag time constant, seconds) is per-env here
-    — unlike the other fields, its natural "disabled" nominal is exactly 0.0,
-    for which *multiplicatively* scaling around nominal is degenerate (0 *
-    anything = 0). domain_rand_fn implementations should sample it as an
-    absolute range instead — see race/dynamics.py's motor_tau_range.
-    _single_step derives alpha = sim_dt / (motor_tau + sim_dt) fresh from
-    this field every step, which already reduces to alpha=1.0 (no lag, the
-    old zero-order-hold behavior) exactly when motor_tau=0 — no separate
+    — unlike the other multiplicative fields, its natural "disabled" nominal
+    is exactly 0.0, for which *multiplicatively* scaling around nominal is
+    degenerate (0 * anything = 0). domain_rand_fn implementations should
+    sample it as an absolute range instead — see race/dynamics.py's
+    motor_tau_range. motor_physics_step discretizes it fresh every substep
+    (ad = exp(-sim_dt/motor_tau)), which already reduces to an exact
+    zero-order-hold (motor_rpm := rpm_cmd) at motor_tau=0 — no separate
     branch needed.
+
+    motor_inertia (rotor angular inertia, kg*m^2) is new: the coefficient on
+    the reaction torque the spinning rotor's own angular acceleration
+    exerts back on the airframe (see motor_physics.py's module docstring).
+    0.0 (its own degenerate-but-valid value, same convention as motor_tau)
+    disables this term entirely.
     """
     kf: Any
     km: Any
@@ -115,6 +131,25 @@ class PhysParams(NamedTuple):
     hover_rpm: Any
     differential_frac: Any
     motor_tau: Any
+    motor_inertia: Any
+
+
+class ModelParams(NamedTuple):
+    """Per-env rigid-body model parameters that DO live on the compiled MJX
+    Model (unlike PhysParams' hand-computed mixer/motor coefficients) —
+    body mass and diagonal inertia. Kept separate from PhysParams rather
+    than merged into it because applying these requires rebuilding a
+    per-lane mjx.Model via tree_replace (see _model_for), not just reading a
+    plain JAX value inside the force/torque math.
+
+    Sampled by mass_inertia_rand_fn (a third hook, orthogonal to reset_fn
+    "where" and domain_rand_fn "mixer/motor coefficients") once per env per
+    episode reset, same lifecycle as phys_params. None (default) keeps
+    every env on the nominal mass/inertia baked into the XML at build time
+    — strictly additive, zero behavior change when unused.
+    """
+    body_mass: Any        # scalar, kg
+    body_inertia: Any     # (3,), kg*m^2 — diagonal
 
 
 class MJXState(NamedTuple):
@@ -133,6 +168,7 @@ class MJXState(NamedTuple):
     motor_rpm: Any          # (num_envs, 4) float32 — actual (lagged) per-motor RPM;
                              # see motor_tau in __init__. Equals the commanded RPM
                              # exactly, every substep, when motor_tau=0 (the default).
+    model_params: Any       # ModelParams (batched over num_envs) — see mass_inertia_rand_fn
 
 
 # ---------------------------------------------------------------------------
@@ -142,10 +178,17 @@ class MJXState(NamedTuple):
 _BODY_ID = 1  # drone body index in the MJX model
 
 # Diagonal body inertia (kg*m^2) baked into every drone's <inertial> tag in
-# _generate_xml below — a real MJX rigid-body model constant, not a plain
-# JAX value PhysParams can carry (see PhysParams' own docstring on why
-# mass/inertia are excluded from domain randomization here).
-_INERTIA_DIAG = (1.4e-5, 1.4e-5, 2.17e-5)
+# _generate_xml below by default — a real MJX rigid-body model constant, not
+# a plain JAX value PhysParams can carry (see ModelParams for the field that
+# lets this be randomized per-env instead). Reference platform's own fitted
+# values (see motor_physics.py's module docstring for the platform this
+# whole physics model was ported from).
+_INERTIA_DIAG = (3.3e-5, 3.6e-5, 7.19e-5)
+
+# Default max_rpm: the RPM at which motor_physics.py's fitted curves' own
+# pwm=1.0 calibration point (_OMEGA_REF_RAD_S) is reached — not an
+# independent platform spec, derived from the curve fit itself.
+_DEFAULT_MAX_RPM = _motor._OMEGA_REF_RAD_S * 60.0 / (2.0 * np.pi)
 
 class MJXVectorAviary:
     """GPU-vectorized multi-drone aviary using MuJoCo MJX.
@@ -180,9 +223,11 @@ class MJXVectorAviary:
         When None a small position-noise reset is used for hover; the plugin
         should supply a reset_fn for tasks that need something different.
     mass, kf, km, arm_length, max_rpm : float
-        Nominal drone dynamics constants. Default to the Crazyflie 2.x values
-        this module was built around; override to simulate a different
-        drone platform without editing this file.
+        Nominal drone dynamics constants. Default to the reference platform
+        motor_physics.py's thrust/torque curves were fitted against; override
+        to simulate a different drone platform without editing this file.
+        kf/km are dimensionless multipliers on those curves (nominal 1.0
+        each), not raw physical coefficients — see PhysParams' docstring.
     action_type : {"rpm", "attitude"}
         "rpm": direct per-motor command (mix_rpm_action). "attitude": fixed-gain
         thrust + roll/pitch/yaw_rate differential mixer with no feedback
@@ -213,6 +258,24 @@ class MJXVectorAviary:
         range — 0 is motor_tau's degenerate-but-valid "disabled" value, and
         multiplying 0 by anything is still 0, which is why it's absolute
         rather than scaled around this nominal).
+    motor_inertia : float
+        Nominal rotor angular inertia (kg*m^2); 5e-8 (default) is the
+        reference platform's own fitted value. Drives the reaction torque
+        the spinning rotor's own angular acceleration exerts back on the
+        airframe — see motor_physics.py's module docstring. 0.0 disables
+        this term entirely, same convention as motor_tau=0.
+    mass_inertia_rand_fn : callable or None
+        ``(rng, nominal_mass: float, nominal_inertia_diag: (3,)) ->
+        (mass, inertia_diag)`` — a third randomization hook, orthogonal to
+        reset_fn ("where") and domain_rand_fn ("mixer/motor coefficients"),
+        called once per env per episode reset (same lifecycle as
+        domain_rand_fn). Unlike PhysParams' fields, mass/inertia are real
+        MJX rigid-body Model fields, not plain JAX values the force/torque
+        math reads directly — applying a randomized draw means rebuilding a
+        per-env mjx.Model via tree_replace (see _model_for), done once per
+        control step (not every substep). None (default) keeps every env
+        on the nominal mass/inertia baked into the XML at build time —
+        strictly additive, zero behavior change when unused.
 
     Example
     -------
@@ -238,13 +301,15 @@ class MJXVectorAviary:
         reset_fn=None,
         action_type: str = "rpm",
         bounding_box: Optional[Tuple[float, float, float]] = None,
-        mass: float = 0.027,
-        kf: float = 3.16e-10,
-        km: float = 7.94e-12,
-        arm_length: float = 0.0397,
-        max_rpm: float = 21714.0,
+        mass: float = 0.0445,
+        kf: float = 1.0,
+        km: float = 1.0,
+        arm_length: float = 0.0499,
+        max_rpm: float = _DEFAULT_MAX_RPM,
         domain_rand_fn=None,
         motor_tau: float = 0.15,
+        motor_inertia: float = 5e-8,
+        mass_inertia_rand_fn=None,
     ):
         _check_deps()
         if plugin is None:
@@ -269,8 +334,10 @@ class MJXVectorAviary:
         self._bounding_box = bounding_box
         self._domain_rand_fn = domain_rand_fn
         self._motor_tau = motor_tau
+        self._mass_inertia_rand_fn = mass_inertia_rand_fn
 
-        # Physical constants — Crazyflie 2.x by default; pass mass/kf/km/
+        # Physical constants — reference platform's fitted values by default
+        # (see motor_physics.py's module docstring); pass mass/kf/km/
         # arm_length/max_rpm to simulate a different drone platform.
         self.mass = mass
         self.gravity = 9.81
@@ -278,8 +345,9 @@ class MJXVectorAviary:
         self.km = km
         self.arm_length = arm_length
         self.max_rpm = max_rpm
-        self.hover_rpm = np.sqrt((self.mass * self.gravity) / (4 * self.kf))
+        self.hover_rpm = float(_motor.solve_hover_rpm(np, self.kf, self.mass, self.gravity, self.max_rpm))
         self.differential_frac = 0.02  # nominal mix_attitude_rpm gain — see PhysParams
+        self._motor_inertia = motor_inertia
         self._inertia_diag = jnp.array(_INERTIA_DIAG)
         # Nominal per-env dynamics — what every env uses when domain_rand_fn
         # is None, and the baseline domain_rand_fn perturbs around otherwise.
@@ -288,7 +356,11 @@ class MJXVectorAviary:
             max_rpm=self.max_rpm, hover_rpm=self.hover_rpm,
             differential_frac=self.differential_frac,
             motor_tau=self._motor_tau,
+            motor_inertia=self._motor_inertia,
         )
+        # Nominal rigid-body model params — every env uses this fixed value
+        # unless mass_inertia_rand_fn overrides it. See ModelParams.
+        self._nominal_model = ModelParams(body_mass=self.mass, body_inertia=self._inertia_diag)
 
         # Gate xyz positions — needed only for XML marker generation.
         # Retrieved from the plugin so there's one source of truth.
@@ -397,6 +469,12 @@ class MJXVectorAviary:
                 lambda x: jnp.broadcast_to(x, (self.num_envs,)), self._nominal_phys
             ),
             motor_rpm=jnp.broadcast_to(self.hover_rpm, (self.num_envs, 4)),
+            # body_inertia is (3,), not a scalar like every PhysParams field,
+            # hence the shape-aware broadcast (matches batched_data's own
+            # pattern above) rather than phys_params' simpler one.
+            model_params=jax.tree_util.tree_map(
+                lambda x: jnp.broadcast_to(x, (self.num_envs, *jnp.shape(x))), self._nominal_model
+            ),
         )
         state = self._reset_fn(state, rngs)
         obs = vmap(self._task.get_obs)(
@@ -482,6 +560,18 @@ class MJXVectorAviary:
             state.mjx_data, state.task_state, motor_rpm=state.motor_rpm, phys_params=state.phys_params
         )
 
+    def _model_for(self, model_params: "ModelParams"):
+        """Rebuild this env's mjx.Model from the base template + this
+        episode's (possibly randomized) mass/inertia. A cheap array
+        tree_replace, not a recompile — same cost class as the
+        xfrc_applied replace already done every substep. Called once per
+        control step (model_params is fixed for the whole step, unlike
+        motor_rpm), not inside the substep scan."""
+        return self._mjx_model.tree_replace({
+            "body_mass": self._mjx_model.body_mass.at[_BODY_ID].set(model_params.body_mass),
+            "body_inertia": self._mjx_model.body_inertia.at[_BODY_ID].set(model_params.body_inertia),
+        })
+
     def _single_step(self, state: MJXState, action: Any) -> Tuple[MJXState, Any, Any, Any]:
         """Step a single environment (vmapped over batch)."""
         phys = state.phys_params
@@ -493,35 +583,24 @@ class MJXVectorAviary:
         else:  # "rpm"
             rpm_cmd = mix_rpm_action(jnp, action, phys.hover_rpm, phys.max_rpm)
 
+        model = self._model_for(state.model_params)
         data = state.mjx_data
         sim_dt = 1.0 / self.sim_freq
-        # alpha = 1.0 (no lag) exactly when phys.motor_tau = 0 — the formula
-        # itself reduces to the identity, no separate branch needed. Derived
-        # per-env from phys.motor_tau (not a precomputed self.-level
-        # constant) so a domain_rand_fn can randomize it — see PhysParams.
-        alpha = sim_dt / (phys.motor_tau + sim_dt)
 
         def _physics_step(carry, _):
             d, motor_rpm = carry
             xmat = d.xmat[_BODY_ID].reshape(3, 3)
-            step_rpm_cmd = rpm_cmd
 
-            # First-order motor lag, integrated at the physics rate (not the
-            # control rate): a real motor's RPM moves continuously toward
-            # whatever was just commanded, it doesn't jump there instantly at
-            # the control boundary. alpha=1.0 makes this an identity
-            # (motor_rpm := rpm_cmd every substep), exactly the old
-            # zero-order-hold behavior — same formula, no branch needed.
-            motor_rpm = alpha * step_rpm_cmd + (1.0 - alpha) * motor_rpm
-
-            forces = phys.kf * motor_rpm ** 2
-            total_thrust = jnp.sum(forces)
+            # Motor ODE + reaction torque + cubic thrust/torque curves — see
+            # motor_physics.py's module docstring. Integrated at the physics
+            # rate (not the control rate): a real motor's RPM moves
+            # continuously toward whatever was just commanded, it doesn't
+            # jump there instantly at the control boundary.
+            motor_rpm, total_thrust, tau_x, tau_y, tau_z = _motor.motor_physics_step(
+                jnp, motor_rpm, rpm_cmd, phys.kf, phys.km, phys.arm_length,
+                phys.motor_tau, phys.motor_inertia, sim_dt,
+            )
             thrust_world = xmat @ jnp.array([0.0, 0.0, total_thrust])
-
-            L, s2 = phys.arm_length, jnp.sqrt(2.0)
-            tau_x = (forces[0] + forces[1] - forces[2] - forces[3]) * L / s2
-            tau_y = (-forces[0] + forces[1] + forces[2] - forces[3]) * L / s2
-            tau_z = (-forces[0] + forces[1] - forces[2] + forces[3]) * phys.km / phys.kf
             torque_world = xmat @ jnp.array([tau_x, tau_y, tau_z])
 
             xfrc = jnp.zeros_like(d.xfrc_applied)
@@ -529,7 +608,7 @@ class MJXVectorAviary:
             xfrc = xfrc.at[_BODY_ID, 3:].set(torque_world)
             d = d.replace(xfrc_applied=xfrc)
 
-            d = mjx.step(self._mjx_model, d)
+            d = mjx.step(model, d)
             return (d, motor_rpm), None
 
         (data, motor_rpm), _ = lax.scan(
@@ -591,6 +670,8 @@ class MJXVectorAviary:
             # phys_params it evolves every step (that's the whole point of
             # modeling lag), so it's *not* reset to a fixed value here.
             motor_rpm=motor_rpm,
+            # Same lifecycle as phys_params — fixed for the episode.
+            model_params=state.model_params,
         )
         return new_state, obs, reward, done
 
@@ -620,9 +701,23 @@ class MJXVectorAviary:
             qpos = data.qpos.at[0:3].add(pos_noise)
             data = data.replace(qpos=qpos)
 
+        # Mass/inertia randomization — independent of reset_fn/domain_rand_fn,
+        # resampled fresh every episode reset (see _single_step, which just
+        # carries model_params through unchanged, exactly like phys_params).
+        # None (default) keeps every env on the nominal mjx.Model baked into
+        # the XML at build time.
+        rng, model_rng = jax.random.split(rng)
+        if self._mass_inertia_rand_fn is not None:
+            body_mass, body_inertia = self._mass_inertia_rand_fn(
+                model_rng, self._nominal_model.body_mass, self._nominal_model.body_inertia
+            )
+            model_params = ModelParams(body_mass=body_mass, body_inertia=body_inertia)
+        else:
+            model_params = self._nominal_model
+
         # Propagate qpos → xpos/xmat/cvel so the initial observation and
         # reset_task_state see the correct post-reset kinematic state.
-        data = mjx.forward(self._mjx_model, data)
+        data = mjx.forward(self._model_for(model_params), data)
 
         rng, task_rng = jax.random.split(rng)
         task_state = self._task.reset_task_state(data, task_rng, reset_hint, state.task_state)
@@ -637,6 +732,19 @@ class MJXVectorAviary:
             self._domain_rand_fn(phys_rng, self._nominal_phys)
             if self._domain_rand_fn is not None
             else self._nominal_phys
+        )
+        # hover_rpm is recomputed here rather than trusted from
+        # domain_rand_fn's own return value: domain_rand_fn's (rng, nominal:
+        # PhysParams) -> PhysParams contract only sees kf, never mass (mass
+        # lives outside PhysParams — see ModelParams), so it can't derive a
+        # self-consistent hover_rpm on its own once kf's curve-based
+        # semantics replace the old quadratic law's simple sqrt relationship.
+        # solve_hover_rpm is cheap (a small fixed bisection) and always
+        # correct for whatever kf this episode actually landed on.
+        phys_params = phys_params._replace(
+            hover_rpm=_motor.solve_hover_rpm(
+                jnp, phys_params.kf, model_params.body_mass, self.gravity, phys_params.max_rpm
+            )
         )
 
         reset_info = {}
@@ -662,6 +770,7 @@ class MJXVectorAviary:
             # own weight, which motor_tau > 0 would otherwise make look like
             # a near-guaranteed crash in the first few steps.
             motor_rpm=jnp.full((4,), phys_params.hover_rpm),
+            model_params=model_params,
         )
 
     def _generate_xml(self, plugin) -> str:
@@ -695,7 +804,7 @@ class MJXVectorAviary:
 
         return f"""<mujoco model="mjx_aviary">
   <option integrator="RK4" timestep="{1.0/self.sim_freq}" gravity="0 0 -{self.gravity}"/>
-  <compiler autolimits="true"/>
+  <compiler autolimits="true" balanceinertia="true"/>
 
   <asset>
     <texture type="skybox" builtin="gradient" rgb1="0.55 0.72 0.95" rgb2="0.25 0.45 0.80" width="512" height="3072"/>
