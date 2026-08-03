@@ -2,6 +2,8 @@
 
 MuJoCo-based multi-drone simulation for single- and multi-agent quadcopter RL.
 
+This branch utilizes the more sophisticated system identification for Crazyflie 2.1 Brushless from [How to Model Your Crazyflie Brushless](https://arxiv.org/pdf/2603.05944)
+
 ## Installation
 
 ```bash
